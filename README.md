@@ -46,5 +46,5 @@ emu/
 
 ---
 
-### 🤝 Credits
-Inspired by the architecture of the **i8080** emulator[cite: 1] and the system design of **iSH**.
+### Credits
+Inspired by the architecture of the **i8080** and the system design of **iSH**.
