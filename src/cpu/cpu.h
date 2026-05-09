@@ -3,7 +3,8 @@
 
 #include <stdint.h>
 
-// i386 Register Indices (Standard x86 encoding order)
+// x86 register indices, these match the actual encoding order in the ISA
+// so modrm decoding can just index directly into regs[]
 #define REG_EAX 0
 #define REG_ECX 1
 #define REG_EDX 2
@@ -13,7 +14,6 @@
 #define REG_ESI 6
 #define REG_EDI 7
 
-// CPU State
 typedef struct {
     uint32_t regs[8];
     uint32_t eip;
@@ -23,23 +23,21 @@ typedef struct {
     int cycles;
 } i386;
 
-// Parsed ModR/M Data
+// decoded modrm byte, filled in by parse_modrm in ops.c
 typedef struct {
     uint8_t mod;
-    uint8_t reg; // Often the destination register, or an opcode extension
-    uint8_t rm;  // Register or Memory operand
+    uint8_t reg; // destination reg or opcode extension depending on the instruction
+    uint8_t rm;
 
-    // For memory addressing
     int has_sib;
     int has_disp;
-    uint32_t disp; // Displacement (8-bit or 32-bit sign-extended)
+    uint32_t disp; // sign extended to 32 bits
 } ModRM;
 
-// Core CPU interfaces
 void init_cpu(i386 *cpu);
 void emulate(i386 *cpu);
 
-// Instruction Execution interface (implemented in ops.c)
+// implemented in ops.c
 void execute_opcode(i386 *cpu, uint8_t opcode);
 
 #endif
