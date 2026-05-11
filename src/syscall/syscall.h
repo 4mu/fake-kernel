@@ -3,24 +3,34 @@
 
 #include "../cpu/cpu.h"
 
-// called from the INT 0x80 handler in ops.c
-// reads syscall number from EAX, dispatches, writes return value back to EAX
+void init_brk(uint32_t base);
 void dispatch_syscall(i386 *cpu);
 
-// backend functions, implemented in backend_win32.c
-// args follow the linux i386 ABI: ebx, ecx, edx, esi, edi, ebp
-// return value is negative errno on error, same as linux
+// called once at startup before emulation begins
+void init_fd_table(void);
 
-// SYS_EXIT (1)
+// LINUX_SYS_EXIT (1)
 void sys_exit(i386 *cpu, int status);
 
-// SYS_WRITE (4)  ebx=fd  ecx=buf  edx=count
-int32_t sys_write(i386 *cpu, int fd, uint32_t buf_addr, uint32_t count);
-
-// SYS_READ (3)  ebx=fd  ecx=buf  edx=count
+// LINUX_SYS_READ (3)  ebx=fd  ecx=buf  edx=count
 int32_t sys_read(i386 *cpu, int fd, uint32_t buf_addr, uint32_t count);
 
-// SYS_BRK (45)  ebx=new brk, pass 0 to just query the current break
+// LINUX_SYS_WRITE (4)  ebx=fd  ecx=buf  edx=count
+int32_t sys_write(i386 *cpu, int fd, uint32_t buf_addr, uint32_t count);
+
+// LINUX_SYS_OPEN (5)  ebx=path  ecx=flags  edx=mode
+int32_t sys_open(i386 *cpu, uint32_t path_addr, int flags, int mode);
+
+// LINUX_SYS_CLOSE (6)  ebx=fd
+int32_t sys_close(i386 *cpu, int fd);
+
+// LINUX_SYS_LSEEK (19)  ebx=fd  ecx=offset  edx=whence
+int32_t sys_lseek(i386 *cpu, int fd, int32_t offset, int whence);
+
+// LINUX_SYS_BRK (45)  ebx=new_brk
 uint32_t sys_brk(i386 *cpu, uint32_t new_brk);
+
+// LINUX_SYS_SET_THREAD_AREA (243)  ebx=u_info_addr
+int32_t sys_set_thread_area(i386 *cpu, uint32_t u_info_addr);
 
 #endif
