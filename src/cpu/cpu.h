@@ -32,10 +32,16 @@ typedef struct {
     int has_sib;
     int has_disp;
     uint32_t disp; // sign extended to 32 bits
+    uint8_t sib_base;
+    uint8_t sib_index;
+    uint8_t sib_scale;
 } ModRM;
 
 void init_cpu(i386 *cpu);
 void emulate(i386 *cpu);
+
+void set_gs_base(uint32_t base);
+uint32_t get_gs_base(void);
 
 // implemented in ops.c
 void execute_opcode(i386 *cpu, uint8_t opcode);
