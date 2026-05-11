@@ -156,8 +156,7 @@ int32_t sys_open(i386 *cpu, uint32_t path_addr, int flags, int mode) {
     if (flags & O_CREAT) creation = (flags & O_TRUNC) ? CREATE_ALWAYS : OPEN_ALWAYS;
     else if (flags & O_TRUNC) creation = TRUNCATE_EXISTING;
 
-    HANDLE h = CreateFileA(path, access, FILE_SHARE_READ, NULL,
-                           creation, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE h = CreateFileA(path, access, FILE_SHARE_READ, NULL, creation, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
         if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return -ENOENT;
@@ -199,9 +198,9 @@ int32_t sys_lseek(i386 *cpu, int fd, int32_t offset, int whence) {
 #ifdef _WIN32
     DWORD method;
     switch (whence) {
-        case 0: method = FILE_BEGIN;   break; // SEEK_SET
+        case 0: method = FILE_BEGIN; break; // SEEK_SET
         case 1: method = FILE_CURRENT; break; // SEEK_CUR
-        case 2: method = FILE_END;     break; // SEEK_END
+        case 2: method = FILE_END; break; // SEEK_END
         default: return -EINVAL;
     }
     DWORD result = SetFilePointer(fd_table[fd].handle, (LONG)offset, NULL, method);
@@ -239,9 +238,7 @@ int32_t sys_set_thread_area(i386 *cpu, uint32_t u_info_addr) {
     if (!desc) return -EFAULT;
 
     // entry_number of -1 means the kernel picks one, just use slot 0
-    if (desc->entry_number == (uint32_t)-1) {
-        desc->entry_number = 0;
-    }
+    if (desc->entry_number == (uint32_t)-1) desc->entry_number = 0;
 
     set_gs_base(desc->base_addr);
     printf("set_thread_area: GS base set to 0x%08X\n", desc->base_addr);

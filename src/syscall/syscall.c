@@ -15,7 +15,7 @@
 #define ENOSYS  38
 
 void dispatch_syscall(i386 *cpu) {
-    uint32_t nr  = cpu->regs[REG_EAX];
+    uint32_t nr = cpu->regs[REG_EAX];
     uint32_t ebx = cpu->regs[REG_EBX];
     uint32_t ecx = cpu->regs[REG_ECX];
     uint32_t edx = cpu->regs[REG_EDX];
