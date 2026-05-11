@@ -64,7 +64,7 @@ static uint32_t push_string(uint32_t *str_ptr, const char *s) {
     return addr;
 }
 
-int load_elf(const char *path, i386 *cpu) {
+int load_elf(const char *path, i386 *cpu, LoadInfo *info) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         perror("loader: fopen");
@@ -85,21 +85,25 @@ int load_elf(const char *path, i386 *cpu) {
         fclose(f);
         return 0;
     }
+
     if (ehdr.e_ident[4] != ELFCLASS32) {
         fprintf(stderr, "loader: not a 32 bit ELF (class=%d)\n", ehdr.e_ident[4]);
         fclose(f);
         return 0;
     }
+
     if (ehdr.e_ident[5] != ELFDATA2LSB) {
         fprintf(stderr, "loader: not little endian\n");
         fclose(f);
         return 0;
     }
+
     if (ehdr.e_type != ET_EXEC) {
         fprintf(stderr, "loader: not an executable (type=%d)\n", ehdr.e_type);
         fclose(f);
         return 0;
     }
+
     if (ehdr.e_machine != EM_386) {
         fprintf(stderr, "loader: not i386 (machine=%d)\n", ehdr.e_machine);
         fclose(f);
@@ -112,10 +116,13 @@ int load_elf(const char *path, i386 *cpu) {
         return 0;
     }
 
+    uint32_t load_end = 0;
+
     // walk the program headers and load any PT_LOAD segments into guest memory
 
     for (int i = 0; i < ehdr.e_phnum; i++) {
         long off = (long)(ehdr.e_phoff + (uint32_t)i * ehdr.e_phentsize);
+
         if (fseek(f, off, SEEK_SET) != 0) {
             fprintf(stderr, "loader: fseek to phdr %d failed\n", i);
             fclose(f);
@@ -123,6 +130,7 @@ int load_elf(const char *path, i386 *cpu) {
         }
 
         Elf32_Phdr phdr;
+
         if (fread(&phdr, sizeof(phdr), 1, f) != 1) {
             fprintf(stderr, "loader: couldn't read phdr %d\n", i);
             fclose(f);
@@ -130,20 +138,20 @@ int load_elf(const char *path, i386 *cpu) {
         }
 
         if (phdr.p_type != PT_LOAD) continue;
-        if (phdr.p_memsz == 0)      continue;
+
+        if (phdr.p_memsz == 0) continue;
 
         if ((size_t)phdr.p_vaddr + phdr.p_memsz > mem_size()) {
-            fprintf(stderr, "loader: segment %d at 0x%08X is too big for guest memory\n",
-                    i, phdr.p_vaddr);
+            fprintf(stderr, "loader: segment %d at 0x%08X is too big for guest memory\n", i, phdr.p_vaddr);
             fclose(f);
             return 0;
         }
 
         // zero the whole region first so BSS is handled automatically
+
         uint32_t vaddr = phdr.p_vaddr;
-        for (uint32_t b = 0; b < phdr.p_memsz; b++) {
-            mem_write8(vaddr + b, 0);
-        }
+
+        for (uint32_t b = 0; b < phdr.p_memsz; b++) mem_write8(vaddr + b, 0);
 
         if (phdr.p_filesz > 0) {
             if (fseek(f, (long)phdr.p_offset, SEEK_SET) != 0) {
@@ -151,54 +159,42 @@ int load_elf(const char *path, i386 *cpu) {
                 fclose(f);
                 return 0;
             }
+
             // read in 4k chunks so we're not mallocing the whole segment on the host
+
             uint32_t remaining = phdr.p_filesz;
-            uint32_t dst       = vaddr;
-            uint8_t  chunk[4096];
+            uint32_t dst = vaddr;
+            uint8_t chunk[4096];
+
             while (remaining > 0) {
                 uint32_t to_read = remaining < sizeof(chunk) ? remaining : (uint32_t)sizeof(chunk);
+
                 if (fread(chunk, 1, to_read, f) != to_read) {
                     fprintf(stderr, "loader: short read on segment %d\n", i);
                     fclose(f);
                     return 0;
                 }
+
                 mem_copy_in(dst, chunk, to_read);
-                dst       += to_read;
+
+                dst += to_read;
                 remaining -= to_read;
             }
         }
 
-        printf("loader: segment %d  vaddr=0x%08X  filesz=0x%X  memsz=0x%X\n",
-               i, phdr.p_vaddr, phdr.p_filesz, phdr.p_memsz);
+        uint32_t seg_end = phdr.p_vaddr + phdr.p_memsz;
+
+        if (seg_end > load_end) load_end = seg_end;
+
+        printf("loader: segment %d  vaddr=0x%08X  filesz=0x%X  memsz=0x%X\n", i, phdr.p_vaddr, phdr.p_filesz, phdr.p_memsz);
     }
 
-    fclose(f);
+    info->load_end = (load_end + 0xFFF) & ~0xFFFu;
 
     cpu->eip = ehdr.e_entry;
-    printf("loader: entry EIP=0x%08X\n", cpu->eip);
 
-    // build the initial stack at the top of guest memory
-    // using 1MB for the stack, should be plenty for simple binaries
-    const size_t STACK_SIZE = 1024 * 1024;
-    uint32_t stack_top  = (uint32_t)(mem_size() - 4);
-    uint32_t stack_base = stack_top - (uint32_t)STACK_SIZE;
+    printf("loader: entry point = 0x%08X\n", ehdr.e_entry);
 
-    // strings go at the bottom of the stack region growing upward
-    uint32_t str_ptr = stack_base;
-    uint32_t argv0_addr = push_string(&str_ptr, path);
-
-    uint32_t esp = stack_top;
-
-    // 16 byte align for the ABI (needed if the guest uses SSE)
-    esp &= ~0xFU;
-
-    stack_push32(&esp, 0);           // end of envp
-    stack_push32(&esp, 0);           // end of argv
-    stack_push32(&esp, argv0_addr);  // argv[0]
-    stack_push32(&esp, 1);           // argc
-
-    cpu->regs[REG_ESP] = esp;
-    printf("loader: initial ESP=0x%08X\n", esp);
-
+    fclose(f);
     return 1;
 }
