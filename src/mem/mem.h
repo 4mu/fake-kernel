@@ -7,7 +7,11 @@
 // call once at startup, allocates the flat guest address space
 void init_mem(size_t size);
 
+extern uint32_t g_watch_addr;
+
 void free_mem(void);
+
+extern uint32_t g_last_eip;
 
 // translates a guest address to a real host pointer
 // returns NULL if the address is out of range
