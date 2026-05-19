@@ -1,7 +1,5 @@
 ## Project Still In The Works !!!
 
----
-
 ## x86-to-Win32 Syscall Translator & i386 Emulator
 
 A project designed to run **Linux i386 ELF binaries** on **Windows** by combining a custom i386 instruction set emulator with a syscall translation layer. This project is architecturally inspired by [iSH](https://ish.app/), but targets the Win32 API as its primary backend (mainly for ease of development, with the intention to later port to POSIX/Bionic).
