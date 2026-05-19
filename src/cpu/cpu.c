@@ -11,11 +11,9 @@ void init_cpu(i386 *cpu) {
 
 void emulate(i386 *cpu) {
     while (!cpu->halted) {
+        g_last_eip = cpu->eip;
         uint8_t opcode = mem_read8(cpu->eip);
         cpu->eip++;
-
-        // execute_opcode handles further eip advancement for
-        // any immediates or modrm bytes the instruction needs
         execute_opcode(cpu, opcode);
     }
 }
