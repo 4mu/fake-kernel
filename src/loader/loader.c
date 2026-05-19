@@ -64,7 +64,7 @@ static uint32_t push_string(uint32_t *str_ptr, const char *s) {
     return addr;
 }
 
-int load_elf(const char *path, i386 *cpu, LoadInfo *info) {
+int load_elf(const char *path, i386 *cpu, LoadInfo *info, int argc, char **argv) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         perror("loader: fopen");
@@ -196,5 +196,89 @@ int load_elf(const char *path, i386 *cpu, LoadInfo *info) {
     printf("loader: entry point = 0x%08X\n", ehdr.e_entry);
 
     fclose(f);
+
+    // put strings at the very top, stack grows down below them
+    uint32_t str_ptr = (uint32_t)mem_size() - 4096;
+    uint32_t esp = str_ptr - 4;
+
+    uint32_t argv_addrs[64];
+    int guest_argc = argc - 1;
+    if (guest_argc > 63) guest_argc = 63;
+
+    for (int i = 0; i < guest_argc; i++) argv_addrs[i] = push_string(&str_ptr, argv[i + 1]);
+
+    // push AT_NULL first so it ends up at the TOP (highest address, read last)
+    stack_push32(&esp, 0);
+    stack_push32(&esp, 0);
+
+    // then the rest in any order, they end up below AT_NULL
+    stack_push32(&esp, 32);
+    stack_push32(&esp, 0x1b);  // AT_RSEQ_ALIGN
+
+    stack_push32(&esp, 28);
+    stack_push32(&esp, 0x1a);  // AT_RSEQ_FEATURE_SIZE
+
+    stack_push32(&esp, 0);
+    stack_push32(&esp, 8);     // AT_FLAGS
+
+    stack_push32(&esp, 0);
+    stack_push32(&esp, 7);     // AT_BASE
+
+    stack_push32(&esp, 0);
+    stack_push32(&esp, 23);    // AT_SECURE
+
+    stack_push32(&esp, 1000);
+    stack_push32(&esp, 14);    // AT_EGID
+
+    stack_push32(&esp, 1000);
+    stack_push32(&esp, 13);    // AT_GID
+
+    stack_push32(&esp, 1000);
+    stack_push32(&esp, 12);    // AT_EUID
+
+    stack_push32(&esp, 1000);
+    stack_push32(&esp, 11);    // AT_UID
+
+    stack_push32(&esp, 100);
+    stack_push32(&esp, 17);    // AT_CLKTCK
+
+    stack_push32(&esp, 0x1000);
+    stack_push32(&esp, 6);     // AT_PAGESZ
+
+    stack_push32(&esp, ehdr.e_entry);
+    stack_push32(&esp, 9);     // AT_ENTRY
+
+    stack_push32(&esp, ehdr.e_phnum);
+    stack_push32(&esp, 5);     // AT_PHNUM
+
+    stack_push32(&esp, ehdr.e_phentsize);
+    stack_push32(&esp, 4);     // AT_PHENT
+
+    // push AT_PHDR last so it ends up at the BOTTOM (lowest address, read first)
+    stack_push32(&esp, ehdr.e_phoff + 0x08048000);
+    stack_push32(&esp, 3);     // AT_PHDR
+
+    // end of envp
+    stack_push32(&esp, 0);
+
+    // end of argv
+    stack_push32(&esp, 0);
+
+    // argv pointers, last to first
+    for (int i = guest_argc - 1; i >= 0; i--) stack_push32(&esp, argv_addrs[i]);
+
+    // argc
+    stack_push32(&esp, (uint32_t)guest_argc);
+
+    cpu->regs[REG_ESP] = esp;
+
+    /*
+    printf("loader: stack dump:\n");
+    for (uint32_t a = esp; a < esp + 0x40; a += 4)
+        printf("  [0x%08X] = 0x%08X\n", a, mem_read32(a));
+    */
+
+    printf("loader: stack at 0x%08X  argc=%d\n", esp, guest_argc);
+
     return 1;
 }
