@@ -3,6 +3,8 @@
 
 #include "../cpu/cpu.h"
 
+extern uint32_t g_brk;
+
 void init_brk(uint32_t base);
 void dispatch_syscall(i386 *cpu);
 
