@@ -13,6 +13,7 @@
 #define LINUX_SYS_GETPID          20
 #define LINUX_SYS_KILL            37
 #define LINUX_SYS_BRK             45
+#define LINUX_SYS_SET_ROBUST_LIST 175
 #define LINUX_SYS_MMAP2           192
 #define LINUX_SYS_FUTEX           240
 #define LINUX_SYS_SET_THREAD_AREA 243
@@ -26,8 +27,6 @@ void dispatch_syscall(i386 *cpu) {
     uint32_t ebx = cpu->regs[REG_EBX];
     uint32_t ecx = cpu->regs[REG_ECX];
     uint32_t edx = cpu->regs[REG_EDX];
-
-    fprintf(stderr, "syscall nr=%d ebx=0x%08X ecx=0x%08X edx=0x%08X\n", nr, ebx, ecx, edx);
 
     switch (nr) {
         case LINUX_SYS_EXIT:
@@ -68,6 +67,10 @@ void dispatch_syscall(i386 *cpu) {
             cpu->regs[REG_EAX] = sys_brk(cpu, ebx);
             return;
 
+        case LINUX_SYS_SET_ROBUST_LIST:
+            cpu->regs[REG_EAX] = 0;
+            return;
+
         case LINUX_SYS_MMAP2:
             cpu->regs[REG_EAX] = (uint32_t)-ENOSYS;
             return;
@@ -98,8 +101,8 @@ void dispatch_syscall(i386 *cpu) {
 
         default:
             fprintf(stderr, "syscall: unimplemented nr=%d ebx=0x%08X\n", nr, cpu->regs[REG_EBX]);
+            g_trace = 1;
             cpu->regs[REG_EAX] = (uint32_t)(-ENOSYS);
             return;
     }
-    fprintf(stderr, "syscall nr=%d returned 0x%08X\n", nr, cpu->regs[REG_EAX]);
 }

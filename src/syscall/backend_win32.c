@@ -222,7 +222,6 @@ void init_brk(uint32_t base) {
 
 uint32_t sys_brk(i386 *cpu, uint32_t new_brk) {
     (void)cpu;
-    fprintf(stderr, "brk: request=0x%08X current=0x%08X\n", new_brk, g_brk); //temp
     if (new_brk == 0) return g_brk;
     if (new_brk < g_brk) return g_brk;
     if ((size_t)new_brk >= mem_size()) {
@@ -240,13 +239,20 @@ int32_t sys_set_thread_area(i386 *cpu, uint32_t u_info_addr) {
     if (desc->entry_number == (uint32_t)-1) desc->entry_number = 0;
     set_gs_base(desc->base_addr);
 
-    // fill positive offsets with stub pointers
     for (int i = 0; i < 0x400; i += 4)
         mem_write32(desc->base_addr + i, 0x00001000);
 
-    // zero negative offsets
     for (int i = 4; i <= 0x400; i += 4)
         mem_write32(desc->base_addr - i, 0);
+
+    // GS:[0] is used as a function pointer by glibc's syscall path,
+    // point it at the stub so rogue calls return 0 instead of crashing
+    mem_write32(desc->base_addr + 0x00, 0x00001000);
+
+    // self pointer lives at GS:[0] on some layouts but pthread uses
+    // a separate field, put it at both common offsets to be safe
+    mem_write32(desc->base_addr + 0x04, desc->base_addr);
+    mem_write32(desc->base_addr + 0x08, desc->base_addr);
 
     mem_write32(desc->base_addr + 0x14, 0xDEADBEEF);
 
