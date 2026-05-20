@@ -37,6 +37,9 @@ typedef struct {
     uint8_t sib_scale;
 } ModRM;
 
+// trace flag
+extern int g_trace;
+
 void init_cpu(i386 *cpu);
 void emulate(i386 *cpu);
 
