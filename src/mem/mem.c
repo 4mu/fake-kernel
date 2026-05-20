@@ -59,9 +59,6 @@ uint32_t mem_read32(uint32_t addr) {
 }
 
 void mem_write8(uint32_t addr, uint8_t val) {
-    if (addr >= 0x0FFFED9C && addr <= 0x0FFFED9F)
-        fprintf(stderr, "WATCH8 write 0x%02X to 0x%08X at EIP=0x%08X\n",
-                val, addr, g_last_eip);
     if (!check_bounds(addr, 1, "write8")) return;
     g_mem[addr] = val;
 }
