@@ -23,7 +23,6 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    // 256mb for the guest
     init_mem(1024 * 1024 * 256);
 
     init_opcode_table();
@@ -32,8 +31,6 @@ int main(int argc, char **argv) {
     i386 cpu;
     init_cpu(&cpu);
 
-    // write a stub at STUB_ADDR: XOR EAX,EAX + RET
-    // so uninitialized TLS function pointers return 0 instead of crashing
     mem_write8(STUB_ADDR + 0, 0x31);
     mem_write8(STUB_ADDR + 1, 0xC0);
     mem_write8(STUB_ADDR + 2, 0xC3);
@@ -45,41 +42,31 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    // set up the heap
     init_brk(load_info.load_end);
 
-    // allocate the fake TLS block from the heap so it looks like
-    // a real malloc chunk - glibc will try to realloc it later
-    // and needs a valid chunk header
-    //
-    // malloc chunk layout:
-    //   [base+0] prev_size
-    //   [base+4] size | flags  (PREV_INUSE = 1)
-    //   [base+8] user data  <- this is what we call fake_tls_base
-    //
-    uint32_t chunk_size = (FAKE_TLS_SIZE + 8 + 7) & ~7u; // round up to 8 bytes
+    uint32_t chunk_size = (FAKE_TLS_SIZE + 8 + 7) & ~7u;
     uint32_t chunk_base = load_info.load_end;
     uint32_t fake_tls_base = chunk_base + 8;
 
-    mem_write32(chunk_base + 0, 0);                    // prev_size
-    mem_write32(chunk_base + 4, chunk_size | 1);       // size | PREV_INUSE
+    mem_write32(chunk_base + 0, 0);
+    mem_write32(chunk_base + 4, chunk_size | 1);
 
-    // advance brk past our chunk
     extern uint32_t g_brk;
     g_brk = chunk_base + chunk_size;
 
-    // fill positive offsets with stub pointers (function pointers)
     for (uint32_t i = 0; i < FAKE_TLS_SIZE; i += 4)
         mem_write32(fake_tls_base + i, STUB_ADDR);
 
-    // zero negative offsets (data pointers, not function pointers)
     for (uint32_t i = 4; i <= 0x400; i += 4)
         mem_write32(fake_tls_base - i, 0);
 
-    // GS:[0x8] = pthread self pointer
-    mem_write32(fake_tls_base + 0x8, fake_tls_base);
+    // GS:[0] is called as a function pointer by glibc, keep it as the stub
+    mem_write32(fake_tls_base + 0x00, STUB_ADDR);
 
-    // GS:[0x14] = stack canary
+    // self pointer at both offsets glibc might look at
+    mem_write32(fake_tls_base + 0x04, fake_tls_base);
+    mem_write32(fake_tls_base + 0x08, fake_tls_base);
+
     mem_write32(fake_tls_base + 0x14, 0xDEADBEEF);
 
     set_gs_base(fake_tls_base);
