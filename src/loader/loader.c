@@ -212,11 +212,11 @@ int load_elf(const char *path, i386 *cpu, LoadInfo *info, int argc, char **argv)
     stack_push32(&esp, 0);
 
     // then the rest in any order, they end up below AT_NULL
-    stack_push32(&esp, 32);
-    stack_push32(&esp, 0x1b);  // AT_RSEQ_ALIGN
+    stack_push32(&esp, 64);
+    stack_push32(&esp, 28);    // AT_L1D_CACHE_LINESIZE
 
-    stack_push32(&esp, 28);
-    stack_push32(&esp, 0x1a);  // AT_RSEQ_FEATURE_SIZE
+    stack_push32(&esp, 64);
+    stack_push32(&esp, 27);    // AT_L1I_CACHE_LINESIZE
 
     stack_push32(&esp, 0);
     stack_push32(&esp, 8);     // AT_FLAGS
@@ -279,6 +279,17 @@ int load_elf(const char *path, i386 *cpu, LoadInfo *info, int argc, char **argv)
     */
 
     printf("loader: stack at 0x%08X  argc=%d\n", esp, guest_argc);
+
+    uint32_t at_phdr = ehdr.e_phoff + 0x08048000;
+    printf("loader: AT_PHDR=0x%08X\n", at_phdr);
+    for (int i = 0; i < ehdr.e_phnum; i++) {
+        uint32_t entry = at_phdr + i * ehdr.e_phentsize;
+        uint32_t type = mem_read32(entry);
+        if (type == 7) {
+            uint32_t align = mem_read32(entry + 28);
+            printf("loader: PT_TLS phdr[%d] in guest memory: p_align=0x%X\n", i, align);
+        }
+    }
 
     return 1;
 }
