@@ -762,15 +762,6 @@ static void op_prefix_gs(i386 *cpu, uint8_t op) {
     (void)op;
     g_seg_override = g_gs_base;
     uint8_t next = mem_read8(cpu->eip++);
-    uint32_t peek_eip = cpu->eip;
-    uint8_t modrm = mem_read8(peek_eip);
-    uint8_t mod = (modrm >> 6) & 3;
-    uint8_t rm  = modrm & 7;
-    int32_t disp = 0;
-    if (mod == 1) disp = (int8_t)mem_read8(peek_eip + 1);
-    else if (mod == 2) disp = (int32_t)mem_read32(peek_eip + 1);
-    fprintf(stderr, "GS prefix next_op=0x%02X gs_base=0x%08X modrm=0x%02X mod=%d rm=%d disp=%d effective=0x%08X\n",
-            next, g_gs_base, modrm, mod, rm, disp, g_gs_base + disp);
     execute_opcode(cpu, next);
     g_seg_override = 0;
     cpu->cycles += 1;
