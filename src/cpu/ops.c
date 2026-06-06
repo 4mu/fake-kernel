@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #define FLAG_CF (1 << 0)
+#define FLAG_PF (1 << 2)
 #define FLAG_ZF (1 << 6)
 #define FLAG_SF (1 << 7)
 #define FLAG_OF (1 << 11)
@@ -26,6 +27,15 @@ static opcode_handler_0f opcode_table_0f[256];
 static void set_cf(i386 *cpu, int cf) {
     if (cf) cpu->eflags |= FLAG_CF;
     else cpu->eflags &= ~FLAG_CF;
+}
+
+static void set_pf(i386 *cpu, uint32_t result) {
+    uint8_t b = (uint8_t)result;
+    b ^= b >> 4;
+    b ^= b >> 2;
+    b ^= b >> 1;
+    if (!(b & 1)) cpu->eflags |= FLAG_PF;
+    else cpu->eflags &= ~FLAG_PF;
 }
 
 static void set_zf(i386 *cpu, uint32_t result) {
@@ -53,9 +63,25 @@ static void set_of_sub(i386 *cpu, uint32_t a, uint32_t b, uint32_t result) {
 }
 
 static int get_cf(i386 *cpu) { return (cpu->eflags >> 0)  & 1; }
+static int get_pf(i386 *cpu) { return (cpu->eflags >> 2)  & 1; }
 static int get_zf(i386 *cpu) { return (cpu->eflags >> 6)  & 1; }
 static int get_sf(i386 *cpu) { return (cpu->eflags >> 7)  & 1; }
 static int get_of(i386 *cpu) { return (cpu->eflags >> 11) & 1; }
+
+static inline uint8_t get_reg8(i386 *cpu, int reg) {
+    // regs 0-3 = AL CL DL BL (low byte), 4-7 = AH CH DH BH (high byte)
+    if (reg < 4)
+        return (uint8_t)(cpu->regs[reg]);
+    else
+        return (uint8_t)(cpu->regs[reg - 4] >> 8);
+}
+
+static inline void set_reg8(i386 *cpu, int reg, uint8_t val) {
+    if (reg < 4)
+        cpu->regs[reg] = (cpu->regs[reg] & 0xFFFFFF00) | val;
+    else
+        cpu->regs[reg - 4] = (cpu->regs[reg - 4] & 0xFFFF00FF) | ((uint32_t)val << 8);
+}
 
 // modrm and addressing helpers
 
@@ -174,8 +200,8 @@ static void op_cmovcc(i386 *cpu, uint8_t op) {
         case 0x47: taken = !get_cf(cpu) && !get_zf(cpu); break; // CMOVA
         case 0x48: taken =  get_sf(cpu); break; // CMOVS
         case 0x49: taken = !get_sf(cpu); break; // CMOVNS
-        case 0x4A: taken = 0; break; // CMOVP stub, parity flag not implemented
-        case 0x4B: taken = 1; break; // CMOVNP stub
+        case 0x4A: taken =  get_pf(cpu); break; // CMOVP stub, parity flag not implemented
+        case 0x4B: taken = !get_pf(cpu); break; // CMOVNP stub
         case 0x4C: taken =  get_sf(cpu) != get_of(cpu); break; // CMOVL
         case 0x4D: taken =  get_sf(cpu) == get_of(cpu); break; // CMOVGE
         case 0x4E: taken =  get_zf(cpu) || (get_sf(cpu) != get_of(cpu)); break; // CMOVLE
@@ -187,6 +213,36 @@ static void op_cmovcc(i386 *cpu, uint8_t op) {
     }
     if (taken) cpu->regs[mrm.reg] = src;
     cpu->cycles += 2;
+}
+
+// 0x0F 0x74-0x7D JCC short
+static void op_jcc_short(i386 *cpu, uint8_t op) {
+    int8_t offset = (int8_t)mem_read8(cpu->eip++);
+    int taken = 0;
+    switch (op) {
+        case 0x70: taken =  get_of(cpu); break; // JO
+        case 0x71: taken = !get_of(cpu); break; // JNO
+        case 0x72: taken =  get_cf(cpu); break; // JB/JNAE
+        case 0x73: taken = !get_cf(cpu); break; // JNB/JAE
+        case 0x74: taken =  get_zf(cpu); break; // JE/JZ
+        case 0x75: taken = !get_zf(cpu); break; // JNE/JNZ
+        case 0x76: taken =  get_cf(cpu) || get_zf(cpu);  break; // JBE
+        case 0x77: taken = !get_cf(cpu) && !get_zf(cpu); break; // JA
+        case 0x78: taken =  get_sf(cpu); break; // JS
+        case 0x79: taken = !get_sf(cpu); break; // JNS
+        case 0x7A: taken =  get_pf(cpu); break; // JP stub, parity flag not implemented
+        case 0x7B: taken = !get_pf(cpu); break; // JNP stub
+        case 0x7C: taken =  get_sf(cpu) != get_of(cpu); break; // JL
+        case 0x7D: taken =  get_sf(cpu) == get_of(cpu); break; // JGE
+        case 0x7E: taken =  get_zf(cpu) || (get_sf(cpu) != get_of(cpu)); break; // JLE
+        case 0x7F: taken = !get_zf(cpu) && (get_sf(cpu) == get_of(cpu)); break; // JG
+        default:
+            fprintf(stderr, "unhandled Jcc short op=0x%02X\n", op);
+            cpu->halted = 1;
+            return;
+    }
+    if (taken) cpu->eip += offset;
+    cpu->cycles += 1;
 }
 
 // 0x0F 0x8x JCC near
@@ -234,8 +290,8 @@ static void op_setcc(i386 *cpu, uint8_t op) {
         case 0x97: val = !get_cf(cpu) && !get_zf(cpu); break; // SETA
         case 0x98: val =  get_sf(cpu); break; // SETS
         case 0x99: val = !get_sf(cpu); break; // SETNS
-        case 0x9A: val = 0; break; // SETP stub
-        case 0x9B: val = 1; break; // SETNP stub
+        case 0x9A: val =  get_pf(cpu); break; // SETP stub
+        case 0x9B: val = !get_pf(cpu); break; // SETNP stub
         case 0x9C: val =  get_sf(cpu) != get_of(cpu); break; // SETL
         case 0x9D: val =  get_sf(cpu) == get_of(cpu); break; // SETGE
         case 0x9E: val =  get_zf(cpu) || (get_sf(cpu) != get_of(cpu)); break; // SETLE
@@ -246,7 +302,7 @@ static void op_setcc(i386 *cpu, uint8_t op) {
             return;
     }
     if (mrm.mod == 3)
-        cpu->regs[mrm.rm] = (cpu->regs[mrm.rm] & 0xFFFFFF00) | val;
+        set_reg8(cpu, mrm.rm, val);
     else
         mem_write8(resolve_rm_addr(cpu, &mrm), val);
     cpu->cycles += 2;
@@ -354,7 +410,7 @@ static void op_movzx_r32_rm8(i386 *cpu, uint8_t op) {
     ModRM mrm;
     parse_modrm(cpu, &mrm);
     uint8_t val = (mrm.mod == 3)
-        ? (uint8_t)cpu->regs[mrm.rm]
+        ? get_reg8(cpu, mrm.rm)
         : mem_read8(resolve_rm_addr(cpu, &mrm));
     cpu->regs[mrm.reg] = (uint32_t)val;
     cpu->cycles += 2;
@@ -386,6 +442,7 @@ static void op_add_rm32_r32(i386 *cpu, uint8_t op) {
     set_cf(cpu, result < a);
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_add(cpu, a, b, result);
     cpu->cycles += 2;
 }
@@ -402,6 +459,7 @@ static void op_add_r32_rm32(i386 *cpu, uint8_t op) {
     set_cf(cpu, result < a);
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_add(cpu, a, b, result);
     cpu->cycles += 2;
 }
@@ -417,7 +475,24 @@ static void op_add_eax_imm32(i386 *cpu, uint8_t op) {
     set_cf(cpu, result < a);
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_add(cpu, a, b, result);
+    cpu->cycles += 1;
+}
+
+// 0x06, 0x16, 0x1E, PUSH
+static void op_push_sreg(i386 *cpu, uint8_t op) {
+    (void)op;
+    // segment registers are irrelevant in flat model, push 0
+    cpu->regs[REG_ESP] -= 4;
+    mem_write32(cpu->regs[REG_ESP], 0);
+    cpu->cycles += 1;
+}
+
+// 0x07, 0x17, 0x1F POP
+static void op_pop_sreg(i386 *cpu, uint8_t op) {
+    (void)op;
+    cpu->regs[REG_ESP] += 4; // discard
     cpu->cycles += 1;
 }
 
@@ -430,6 +505,7 @@ static void op_or_rm32_r32(i386 *cpu, uint8_t op) {
     write_rm32(cpu, &mrm, result);
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_cf(cpu, 0);
     cpu->cycles += 2;
 }
@@ -444,6 +520,7 @@ static void op_or_r32_rm32(i386 *cpu, uint8_t op) {
     set_zf(cpu, result);
     set_sf(cpu, result);
     set_cf(cpu, 0);
+    set_pf(cpu, (uint32_t)result);
     cpu->cycles += 2;
 }
 
@@ -456,6 +533,7 @@ static void op_or_eax_imm32(i386 *cpu, uint8_t op) {
     cpu->regs[REG_EAX] = result;
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_cf(cpu, 0);
     cpu->cycles += 1;
 }
@@ -473,6 +551,7 @@ static void op_adc_rm32_r32(i386 *cpu, uint8_t op) {
     set_cf(cpu, result < a || (cf && result == a));
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_add(cpu, a, b, result);
     cpu->cycles += 2;
 }
@@ -490,6 +569,7 @@ static void op_adc_r32_rm32(i386 *cpu, uint8_t op) {
     set_cf(cpu, result < a || (cf && result == a));
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_add(cpu, a, b, result);
     cpu->cycles += 2;
 }
@@ -507,6 +587,7 @@ static void op_sbb_rm32_r32(i386 *cpu, uint8_t op) {
     set_cf(cpu, a < b + cf || (cf && b == 0xFFFFFFFF));
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_sub(cpu, a, b, result);
     cpu->cycles += 2;
 }
@@ -524,6 +605,7 @@ static void op_sbb_r32_rm32(i386 *cpu, uint8_t op) {
     set_cf(cpu, a < b + cf || (cf && b == 0xFFFFFFFF));
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_sub(cpu, a, b, result);
     cpu->cycles += 2;
 }
@@ -537,6 +619,7 @@ static void op_and_rm32_r32(i386 *cpu, uint8_t op) {
     write_rm32(cpu, &mrm, result);
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_cf(cpu, 0);
     cpu->cycles += 2;
 }
@@ -550,6 +633,7 @@ static void op_and_r32_rm32(i386 *cpu, uint8_t op) {
     cpu->regs[mrm.reg] = result;
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_cf(cpu, 0);
     cpu->cycles += 2;
 }
@@ -563,6 +647,7 @@ static void op_and_eax_imm32(i386 *cpu, uint8_t op) {
     cpu->regs[REG_EAX] = result;
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_cf(cpu, 0);
     cpu->cycles += 1;
 }
@@ -579,6 +664,7 @@ static void op_sub_rm32_r32(i386 *cpu, uint8_t op) {
     set_cf(cpu, a < b);
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_sub(cpu, a, b, result);
     cpu->cycles += 2;
 }
@@ -595,6 +681,7 @@ static void op_sub_r32_rm32(i386 *cpu, uint8_t op) {
     set_cf(cpu, a < b);
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_sub(cpu, a, b, result);
     cpu->cycles += 2;
 }
@@ -608,6 +695,7 @@ static void op_xor_rm32_r32(i386 *cpu, uint8_t op) {
     write_rm32(cpu, &mrm, result);
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     cpu->cycles += 2;
 }
 
@@ -620,6 +708,7 @@ static void op_xor_r32_rm32(i386 *cpu, uint8_t op) {
     cpu->regs[mrm.reg] = result;
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_cf(cpu, 0);
     cpu->cycles += 2;
 }
@@ -630,13 +719,14 @@ static void op_cmp_rm8_r8(i386 *cpu, uint8_t op) {
     ModRM mrm;
     parse_modrm(cpu, &mrm);
     uint8_t a = (mrm.mod == 3)
-        ? (uint8_t)cpu->regs[mrm.rm]
+        ? get_reg8(cpu, mrm.rm)
         : mem_read8(resolve_rm_addr(cpu, &mrm));
-    uint8_t b = (uint8_t)cpu->regs[mrm.reg];
+    uint8_t b = get_reg8(cpu, mrm.reg);
     uint8_t result = a - b;
     set_cf(cpu, a < b);
     set_zf(cpu, (uint32_t)result);
     set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
     set_of_sub(cpu, a, b, result);
     cpu->cycles += 2;
 }
@@ -652,6 +742,7 @@ static void op_cmp_rm32_r32(i386 *cpu, uint8_t op) {
     set_cf(cpu, a < b);
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_sub(cpu, a, b, result);
     cpu->cycles += 2;
 }
@@ -661,14 +752,15 @@ static void op_cmp_r8_rm8(i386 *cpu, uint8_t op) {
     (void)op;
     ModRM mrm;
     parse_modrm(cpu, &mrm);
-    uint8_t a = (uint8_t)cpu->regs[mrm.reg];
+    uint8_t a = get_reg8(cpu, mrm.reg);
     uint8_t b = (mrm.mod == 3)
-        ? (uint8_t)cpu->regs[mrm.rm]
+        ? get_reg8(cpu, mrm.rm)
         : mem_read8(resolve_rm_addr(cpu, &mrm));
     uint8_t result = a - b;
     set_cf(cpu, a < b);
     set_zf(cpu, (uint32_t)result);
     set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
     set_of_sub(cpu, a, b, result);
     cpu->cycles += 2;
 }
@@ -684,6 +776,7 @@ static void op_cmp_r32_rm32(i386 *cpu, uint8_t op) {
     set_cf(cpu, a < b);
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_sub(cpu, a, b, result);
     cpu->cycles += 2;
 }
@@ -697,6 +790,7 @@ static void op_cmp_al_imm8(i386 *cpu, uint8_t op) {
     set_cf(cpu, a < b);
     set_zf(cpu, (uint32_t)result);
     set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
     set_of_sub(cpu, a, b, result);
     cpu->cycles += 1;
 }
@@ -711,6 +805,7 @@ static void op_cmp_eax_imm32(i386 *cpu, uint8_t op) {
     set_cf(cpu, a < b);
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_sub(cpu, a, b, result);
     cpu->cycles += 1;
 }
@@ -723,6 +818,7 @@ static void op_inc_r32(i386 *cpu, uint8_t op) {
     cpu->regs[reg] = result;
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_add(cpu, a, 1, result);
     // CF is intentionally not touched, x86 behaviour
     cpu->cycles += 1;
@@ -736,6 +832,7 @@ static void op_dec_r32(i386 *cpu, uint8_t op) {
     cpu->regs[reg] = result;
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_of_sub(cpu, a, 1, result);
     // CF is intentionally not touched, x86 behaviour
     cpu->cycles += 1;
@@ -825,36 +922,6 @@ static void op_imul_r32_rm32_imm8(i386 *cpu, uint8_t op) {
     cpu->cycles += 10;
 }
 
-// 0x74-0x7D JCC short
-static void op_jcc_short(i386 *cpu, uint8_t op) {
-    int8_t offset = (int8_t)mem_read8(cpu->eip++);
-    int taken = 0;
-    switch (op) {
-        case 0x70: taken =  get_of(cpu); break; // JO
-        case 0x71: taken = !get_of(cpu); break; // JNO
-        case 0x72: taken =  get_cf(cpu); break; // JB/JNAE
-        case 0x73: taken = !get_cf(cpu); break; // JNB/JAE
-        case 0x74: taken =  get_zf(cpu); break; // JE/JZ
-        case 0x75: taken = !get_zf(cpu); break; // JNE/JNZ
-        case 0x76: taken =  get_cf(cpu) || get_zf(cpu);  break; // JBE
-        case 0x77: taken = !get_cf(cpu) && !get_zf(cpu); break; // JA
-        case 0x78: taken =  get_sf(cpu); break; // JS
-        case 0x79: taken = !get_sf(cpu); break; // JNS
-        case 0x7A: taken =  0; break; // JP stub, parity flag not implemented
-        case 0x7B: taken =  1; break; // JNP stub
-        case 0x7C: taken =  get_sf(cpu) != get_of(cpu); break; // JL
-        case 0x7D: taken =  get_sf(cpu) == get_of(cpu); break; // JGE
-        case 0x7E: taken =  get_zf(cpu) || (get_sf(cpu) != get_of(cpu)); break; // JLE
-        case 0x7F: taken = !get_zf(cpu) && (get_sf(cpu) == get_of(cpu)); break; // JG
-        default:
-            fprintf(stderr, "unhandled Jcc short op=0x%02X\n", op);
-            cpu->halted = 1;
-            return;
-    }
-    if (taken) cpu->eip += offset;
-    cpu->cycles += 1;
-}
-
 // 0x80 group: ADD/OR/AND/SUB/XOR/CMP r/m8, imm8
 static void op_80_group(i386 *cpu, uint8_t op) {
     (void)op;
@@ -862,7 +929,7 @@ static void op_80_group(i386 *cpu, uint8_t op) {
     parse_modrm(cpu, &mrm);
     uint8_t imm = mem_read8(cpu->eip++);
     uint8_t a = (mrm.mod == 3)
-        ? (uint8_t)cpu->regs[mrm.rm]
+        ? get_reg8(cpu, mrm.rm)
         : mem_read8(resolve_rm_addr(cpu, &mrm));
     uint8_t result = 0;
 
@@ -876,12 +943,12 @@ static void op_80_group(i386 *cpu, uint8_t op) {
             result = a | imm;
             set_cf(cpu, 0);
             break;
-        case 2: // ADC, treat carry as 0 for now
+        case 2: // ADC
             result = a + imm;
             set_cf(cpu, result < a);
             set_of_add(cpu, a, imm, result);
             break;
-        case 3: // SBB, treat borrow as 0 for now
+        case 3: // SBB
             result = a - imm;
             set_cf(cpu, a < imm);
             set_of_sub(cpu, a, imm, result);
@@ -903,9 +970,9 @@ static void op_80_group(i386 *cpu, uint8_t op) {
             result = a - imm;
             set_cf(cpu, a < imm);
             set_of_sub(cpu, a, imm, result);
-            // don't write back for CMP
             set_zf(cpu, (uint32_t)result);
             set_sf(cpu, (uint32_t)result);
+            set_pf(cpu, (uint32_t)result);
             cpu->cycles += 2;
             return;
         default:
@@ -915,12 +982,13 @@ static void op_80_group(i386 *cpu, uint8_t op) {
     }
 
     if (mrm.mod == 3)
-        cpu->regs[mrm.rm] = (cpu->regs[mrm.rm] & 0xFFFFFF00) | result;
+        set_reg8(cpu, mrm.rm, result);
     else
         mem_write8(resolve_rm_addr(cpu, &mrm), result);
 
     set_zf(cpu, (uint32_t)result);
     set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
     cpu->cycles += 2;
 }
 
@@ -1033,12 +1101,14 @@ static void op_test_rm8_r8(i386 *cpu, uint8_t op) {
     ModRM mrm;
     parse_modrm(cpu, &mrm);
     uint8_t a = (mrm.mod == 3)
-        ? (uint8_t)cpu->regs[mrm.rm]
+        ? get_reg8(cpu, mrm.rm)
         : mem_read8(resolve_rm_addr(cpu, &mrm));
-    uint8_t b = (uint8_t)cpu->regs[mrm.reg];
+    uint8_t b = get_reg8(cpu, mrm.reg);
     uint8_t result = a & b;
     set_zf(cpu, (uint32_t)result);
     set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
+    set_cf(cpu, 0);
     cpu->cycles += 2;
 }
 
@@ -1050,6 +1120,7 @@ static void op_test_rm32_r32(i386 *cpu, uint8_t op) {
     uint32_t result = read_rm32(cpu, &mrm) & cpu->regs[mrm.reg];
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     cpu->cycles += 2;
 }
 
@@ -1070,8 +1141,8 @@ static void op_mov_rm8_r8(i386 *cpu, uint8_t op) {
     (void)op;
     ModRM mrm;
     parse_modrm(cpu, &mrm);
-    uint8_t val = (uint8_t)cpu->regs[mrm.reg];
-    if (mrm.mod == 3) cpu->regs[mrm.rm] = (cpu->regs[mrm.rm] & 0xFFFFFF00) | val;
+    uint8_t val = get_reg8(cpu, mrm.reg);
+    if (mrm.mod == 3) set_reg8(cpu, mrm.rm, val);
     else mem_write8(resolve_rm_addr(cpu, &mrm), val);
     cpu->cycles += 2;
 }
@@ -1096,8 +1167,10 @@ static void op_mov_r8_rm8(i386 *cpu, uint8_t op) {
     (void)op;
     ModRM mrm;
     parse_modrm(cpu, &mrm);
-    uint8_t val = (mrm.mod == 3) ? (uint8_t)cpu->regs[mrm.rm] : mem_read8(resolve_rm_addr(cpu, &mrm));
-    cpu->regs[mrm.reg] = (cpu->regs[mrm.reg] & 0xFFFFFF00) | val;
+    uint8_t val = (mrm.mod == 3)
+        ? get_reg8(cpu, mrm.rm)
+        : mem_read8(resolve_rm_addr(cpu, &mrm));
+    set_reg8(cpu, mrm.reg, val);
     cpu->cycles += 2;
 }
 
@@ -1202,6 +1275,19 @@ static void op_movsd(i386 *cpu, uint8_t op) {
     cpu->cycles += 2;
 }
 
+// 0xA6 CMPSB - compare [ESI] with [EDI], advance both
+static void op_cmpsb(i386 *cpu, uint8_t op) {
+    (void)op;
+    uint8_t a = mem_read8(cpu->regs[REG_ESI]++);
+    uint8_t b = mem_read8(cpu->regs[REG_EDI]++);
+    uint8_t result = a - b;
+    set_cf(cpu, a < b);
+    set_zf(cpu, (uint32_t)result);
+    set_sf(cpu, (uint32_t)result);
+    set_of_sub(cpu, a, b, result);
+    cpu->cycles += 2;
+}
+
 // 0xA8 TEST AL, imm8
 static void op_test_al_imm8(i386 *cpu, uint8_t op) {
     (void)op;
@@ -1209,6 +1295,7 @@ static void op_test_al_imm8(i386 *cpu, uint8_t op) {
     uint8_t result = (uint8_t)cpu->regs[REG_EAX] & imm;
     set_zf(cpu, (uint32_t)result);
     set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
     set_cf(cpu, 0);
     cpu->cycles += 1;
 }
@@ -1221,6 +1308,7 @@ static void op_test_eax_imm32(i386 *cpu, uint8_t op) {
     uint32_t result = cpu->regs[REG_EAX] & imm;
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
     set_cf(cpu, 0);
     cpu->cycles += 1;
 }
@@ -1230,6 +1318,28 @@ static void op_stosb(i386 *cpu, uint8_t op) {
     (void)op;
     mem_write8(cpu->regs[REG_EDI], (uint8_t)cpu->regs[REG_EAX]);
     cpu->regs[REG_EDI]++;
+    cpu->cycles += 2;
+}
+
+// 0xAB STOSD, store EAX to [EDI] and advance EDI by 4
+static void op_stosd(i386 *cpu, uint8_t op) {
+    (void)op;
+    mem_write32(cpu->regs[REG_EDI], cpu->regs[REG_EAX]);
+    cpu->regs[REG_EDI] += 4;
+    cpu->cycles += 2;
+}
+
+// 0xAE SCASB — compare AL with [EDI], advance EDI
+static void op_scasb(i386 *cpu, uint8_t op) {
+    (void)op;
+    uint8_t a = (uint8_t)cpu->regs[REG_EAX];
+    uint8_t b = mem_read8(cpu->regs[REG_EDI]);
+    cpu->regs[REG_EDI]++;
+    uint8_t result = a - b;
+    set_cf(cpu, a < b);
+    set_zf(cpu, (uint32_t)result);
+    set_sf(cpu, (uint32_t)result);
+    set_of_sub(cpu, a, b, result);
     cpu->cycles += 2;
 }
 
@@ -1308,10 +1418,8 @@ static void op_mov_rm8_imm8(i386 *cpu, uint8_t op) {
     ModRM mrm;
     parse_modrm(cpu, &mrm);
     uint8_t imm = mem_read8(cpu->eip++);
-    if (mrm.mod == 3)
-        cpu->regs[mrm.rm] = (cpu->regs[mrm.rm] & 0xFFFFFF00) | imm;
-    else
-        mem_write8(resolve_rm_addr(cpu, &mrm), imm);
+    if (mrm.mod == 3) set_reg8(cpu, mrm.rm, imm);
+    else mem_write8(resolve_rm_addr(cpu, &mrm), imm);
     cpu->cycles += 2;
 }
 
@@ -1329,9 +1437,18 @@ static void op_mov_rm32_imm32(i386 *cpu, uint8_t op) {
 // 0xC9 LEAVE  (mov esp, ebp; pop ebp)
 static void op_leave(i386 *cpu, uint8_t op) {
     (void)op;
-    cpu->regs[REG_ESP] = cpu->regs[REG_EBP];
-    cpu->regs[REG_EBP] = mem_read32(cpu->regs[REG_ESP]);
-    cpu->regs[REG_ESP] += 4;
+    if (g_operand_size_16) {
+        // 16-bit leave: SP = BP, pop BP
+        cpu->regs[REG_ESP] = (cpu->regs[REG_ESP] & 0xFFFF0000)
+                           | (cpu->regs[REG_EBP] & 0x0000FFFF);
+        uint16_t val = mem_read16(cpu->regs[REG_ESP]);
+        cpu->regs[REG_ESP] += 2;
+        cpu->regs[REG_EBP] = (cpu->regs[REG_EBP] & 0xFFFF0000) | val;
+    } else {
+        cpu->regs[REG_ESP] = cpu->regs[REG_EBP];
+        cpu->regs[REG_EBP] = mem_read32(cpu->regs[REG_ESP]);
+        cpu->regs[REG_ESP] += 4;
+    }
     cpu->cycles += 3;
 }
 
@@ -1498,6 +1615,35 @@ static void op_prefix_lock(i386 *cpu, uint8_t op) {
     cpu->cycles += 1;
 }
 
+// 0xF2 REPNE prefix
+static void op_repne(i386 *cpu, uint8_t op) {
+    (void)op;
+    uint8_t next = mem_read8(cpu->eip++);
+    switch (next) {
+        case 0xAE: { // REPNE SCASB — used by strlen, strchr
+            while (cpu->regs[REG_ECX] > 0) {
+                uint8_t a = (uint8_t)cpu->regs[REG_EAX];
+                uint8_t b = mem_read8(cpu->regs[REG_EDI]);
+                cpu->regs[REG_EDI]++;
+                cpu->regs[REG_ECX]--;
+                uint8_t result = a - b;
+                set_cf(cpu, a < b);
+                set_zf(cpu, (uint32_t)result);
+                set_sf(cpu, (uint32_t)result);
+                set_of_sub(cpu, a, b, result);
+                if (get_zf(cpu)) break;
+            }
+            cpu->cycles += cpu->regs[REG_ECX] + 1;
+            break;
+        }
+        default:
+            fprintf(stderr, "unhandled REPNE instruction 0x%02X at EIP 0x%08X\n",
+                    next, cpu->eip - 2);
+            cpu->halted = 1;
+            break;
+    }
+}
+
 // 0xF3 REP prefix
 static void op_rep(i386 *cpu, uint8_t op) {
     (void)op;
@@ -1574,24 +1720,24 @@ static void op_f6_group(i386 *cpu, uint8_t op) {
     (void)op;
     ModRM mrm;
     parse_modrm(cpu, &mrm);
-
     switch (mrm.reg) {
         case 0: // TEST r/m8, imm8
         case 1: {
             uint8_t imm = mem_read8(cpu->eip++);
             uint8_t a = (mrm.mod == 3)
-                ? (uint8_t)cpu->regs[mrm.rm]
+                ? get_reg8(cpu, mrm.rm)
                 : mem_read8(resolve_rm_addr(cpu, &mrm));
             uint8_t result = a & imm;
             set_zf(cpu, (uint32_t)result);
             set_sf(cpu, (uint32_t)result);
+            set_pf(cpu, (uint32_t)result);
             set_cf(cpu, 0);
             cpu->cycles += 2;
             break;
         }
         case 2: { // NOT r/m8
             if (mrm.mod == 3)
-                cpu->regs[mrm.rm] = (cpu->regs[mrm.rm] & 0xFFFFFF00) | (~cpu->regs[mrm.rm] & 0xFF);
+                set_reg8(cpu, mrm.rm, ~get_reg8(cpu, mrm.rm));
             else {
                 uint32_t addr = resolve_rm_addr(cpu, &mrm);
                 mem_write8(addr, ~mem_read8(addr));
@@ -1601,11 +1747,11 @@ static void op_f6_group(i386 *cpu, uint8_t op) {
         }
         case 3: { // NEG r/m8
             uint8_t val = (mrm.mod == 3)
-                ? (uint8_t)cpu->regs[mrm.rm]
+                ? get_reg8(cpu, mrm.rm)
                 : mem_read8(resolve_rm_addr(cpu, &mrm));
             uint8_t result = (uint8_t)(-(int8_t)val);
             if (mrm.mod == 3)
-                cpu->regs[mrm.rm] = (cpu->regs[mrm.rm] & 0xFFFFFF00) | result;
+                set_reg8(cpu, mrm.rm, result);
             else
                 mem_write8(resolve_rm_addr(cpu, &mrm), result);
             set_cf(cpu, val != 0);
@@ -1615,9 +1761,10 @@ static void op_f6_group(i386 *cpu, uint8_t op) {
             break;
         }
         case 4: { // MUL AX, r/m8
+            // AL * r/m8, result goes into AX (full 16 bits)
             uint16_t result = (uint16_t)(cpu->regs[REG_EAX] & 0xFF) *
                               (uint16_t)((mrm.mod == 3)
-                                  ? (uint8_t)cpu->regs[mrm.rm]
+                                  ? get_reg8(cpu, mrm.rm)
                                   : mem_read8(resolve_rm_addr(cpu, &mrm)));
             cpu->regs[REG_EAX] = (cpu->regs[REG_EAX] & 0xFFFF0000) | result;
             set_cf(cpu, (result >> 8) != 0);
@@ -1625,9 +1772,10 @@ static void op_f6_group(i386 *cpu, uint8_t op) {
             break;
         }
         case 5: { // IMUL AX, r/m8
+            // same deal, signed, result into AX
             int16_t result = (int16_t)(int8_t)(cpu->regs[REG_EAX] & 0xFF) *
                              (int16_t)(int8_t)((mrm.mod == 3)
-                                 ? (uint8_t)cpu->regs[mrm.rm]
+                                 ? get_reg8(cpu, mrm.rm)
                                  : mem_read8(resolve_rm_addr(cpu, &mrm)));
             cpu->regs[REG_EAX] = (cpu->regs[REG_EAX] & 0xFFFF0000) | (uint16_t)result;
             set_cf(cpu, (result >> 8) != (result & 0x80 ? -1 : 0));
@@ -1636,7 +1784,7 @@ static void op_f6_group(i386 *cpu, uint8_t op) {
         }
         case 6: { // DIV AX, r/m8
             uint8_t divisor = (mrm.mod == 3)
-                ? (uint8_t)cpu->regs[mrm.rm]
+                ? get_reg8(cpu, mrm.rm)
                 : mem_read8(resolve_rm_addr(cpu, &mrm));
             if (divisor == 0) {
                 fprintf(stderr, "DIV8 by zero at EIP 0x%08X\n", cpu->eip);
@@ -1644,6 +1792,7 @@ static void op_f6_group(i386 *cpu, uint8_t op) {
                 break;
             }
             uint16_t dividend = (uint16_t)(cpu->regs[REG_EAX] & 0xFFFF);
+            // quotient in AL, remainder in AH
             cpu->regs[REG_EAX] = (cpu->regs[REG_EAX] & 0xFFFF0000)
                 | ((dividend % divisor) << 8)
                 | (dividend / divisor);
@@ -1652,7 +1801,7 @@ static void op_f6_group(i386 *cpu, uint8_t op) {
         }
         case 7: { // IDIV AX, r/m8
             int8_t divisor = (int8_t)((mrm.mod == 3)
-                ? (uint8_t)cpu->regs[mrm.rm]
+                ? get_reg8(cpu, mrm.rm)
                 : mem_read8(resolve_rm_addr(cpu, &mrm)));
             if (divisor == 0) {
                 fprintf(stderr, "IDIV8 by zero at EIP 0x%08X\n", cpu->eip);
@@ -1660,6 +1809,7 @@ static void op_f6_group(i386 *cpu, uint8_t op) {
                 break;
             }
             int16_t dividend = (int16_t)(cpu->regs[REG_EAX] & 0xFFFF);
+            // quotient in AL, remainder in AH
             cpu->regs[REG_EAX] = (cpu->regs[REG_EAX] & 0xFFFF0000)
                 | ((uint8_t)(dividend % divisor) << 8)
                 | (uint8_t)(dividend / divisor);
@@ -1687,6 +1837,7 @@ static void op_f7_group(i386 *cpu, uint8_t op) {
             uint32_t result = read_rm32(cpu, &mrm) & imm;
             set_zf(cpu, result);
             set_sf(cpu, result);
+            set_pf(cpu, (uint32_t)result);
             set_cf(cpu, 0);
             cpu->cycles += 2;
             break;
@@ -1817,13 +1968,19 @@ void init_opcode_table(void) {
     opcode_table[0x01] = op_add_rm32_r32;
     opcode_table[0x03] = op_add_r32_rm32;
     opcode_table[0x05] = op_add_eax_imm32;
+    opcode_table[0x06] = op_push_sreg; // PUSH ES
+    opcode_table[0x07] = op_pop_sreg;  // POP ES
     opcode_table[0x09] = op_or_rm32_r32;
     opcode_table[0x0B] = op_or_r32_rm32;
     opcode_table[0x0D] = op_or_eax_imm32;
     opcode_table[0x11] = op_adc_rm32_r32;
     opcode_table[0x13] = op_adc_r32_rm32;
+    opcode_table[0x16] = op_push_sreg; // PUSH SS
+    opcode_table[0x17] = op_pop_sreg;  // POP SS
     opcode_table[0x19] = op_sbb_rm32_r32;
     opcode_table[0x1B] = op_sbb_r32_rm32;
+    opcode_table[0x1E] = op_push_sreg; // PUSH DS
+    opcode_table[0x1F] = op_pop_sreg;  // POP DS
     opcode_table[0x21] = op_and_rm32_r32;
     opcode_table[0x23] = op_and_r32_rm32;
     opcode_table[0x25] = op_and_eax_imm32;
@@ -1872,9 +2029,12 @@ void init_opcode_table(void) {
     opcode_table[0xA3] = op_mov_mem_eax;
     opcode_table[0xA4] = op_movsb;
     opcode_table[0xA5] = op_movsd;
+    opcode_table[0xA6] = op_cmpsb;
     opcode_table[0xA8] = op_test_al_imm8;
     opcode_table[0xA9] = op_test_eax_imm32;
     opcode_table[0xAA] = op_stosb;
+    opcode_table[0xAB] = op_stosd;
+    opcode_table[0xAE] = op_scasb;
     for (int i = 0xB8; i <= 0xBF; i++) opcode_table[i] = op_mov_r32_imm32;
     opcode_table[0xC1] = op_c1_group;
     opcode_table[0xC3] = op_ret;
@@ -1889,6 +2049,7 @@ void init_opcode_table(void) {
     opcode_table[0xE9] = op_jmp_near;
     opcode_table[0xEB] = op_jmp_short;
     opcode_table[0xF0] = op_prefix_lock;
+    opcode_table[0xF2] = op_repne;
     opcode_table[0xF3] = op_rep;
     opcode_table[0xF4] = op_hlt;
     opcode_table[0xF6] = op_f6_group;
