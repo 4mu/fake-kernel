@@ -32,10 +32,10 @@ int main(int argc, char **argv) {
     i386 cpu;
     init_cpu(&cpu);
 
-    // a tiny stub: xor eax, eax; ret
-    // used as a safe landing pad for any glibc function pointer calls through GS
-    mem_write8(STUB_ADDR + 0, 0x31);
-    mem_write8(STUB_ADDR + 1, 0xC0);
+    // int 0x80; ret, __kernel_vsyscall trampoline, glibc calls syscalls through GS:0x10
+    // which points here, so this needs to dispatch via int 0x80 not just return
+    mem_write8(STUB_ADDR + 0, 0xCD);
+    mem_write8(STUB_ADDR + 1, 0x80);
     mem_write8(STUB_ADDR + 2, 0xC3);
 
     LoadInfo load_info;
