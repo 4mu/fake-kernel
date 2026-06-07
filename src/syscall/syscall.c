@@ -14,8 +14,9 @@
 #define LINUX_SYS_KILL              37
 #define LINUX_SYS_BRK               45
 #define LINUX_SYS_MUNMAP            91
-#define LINUX_SYS_MPROTECT          125
 #define LINUX_SYS_UNAME             122
+#define LINUX_SYS_MPROTECT          125
+#define LINUX_SYS_LLSEEK            140
 #define LINUX_SYS_RT_SIGRETURN      173
 #define LINUX_SYS_RT_SIGACTION      174
 #define LINUX_SYS_RT_SIGPROCMASK    175
@@ -48,6 +49,8 @@ void dispatch_syscall(i386 *cpu) {
     uint32_t esi = cpu->regs[REG_ESI];
     uint32_t edi = cpu->regs[REG_EDI];
     uint32_t ebp = cpu->regs[REG_EBP];
+
+    fprintf(stderr, "syscall nr=%u ebx=0x%08X ecx=0x%08X edx=0x%08X\n", nr, ebx, ecx, edx);
 
     switch (nr) {
         case LINUX_SYS_EXIT:
@@ -111,6 +114,30 @@ void dispatch_syscall(i386 *cpu) {
             cpu->regs[REG_EAX] = (uint32_t)sys_mprotect(cpu, ebx, ecx, (int)edx);
             return;
 
+        case LINUX_SYS_LLSEEK: { // _llseek
+            int fd = (int)ebx;
+            uint32_t offset_high = ecx;
+            uint32_t offset_low  = edx;
+            uint32_t result_ptr  = esi;
+            int whence = (int)edi;
+            // if offset_high is non-zero we can't handle it, just fail
+            if (offset_high != 0 && offset_high != 0xFFFFFFFF) {
+                cpu->regs[REG_EAX] = (uint32_t)(-22); // EINVAL
+                return;
+            }
+            int32_t result = sys_lseek(cpu, fd, (int32_t)offset_low, whence);
+            if (result < 0) {
+                cpu->regs[REG_EAX] = (uint32_t)result;
+                return;
+            }
+            if (result_ptr) {
+                mem_write32(result_ptr,     (uint32_t)result);
+                mem_write32(result_ptr + 4, 0);
+            }
+            cpu->regs[REG_EAX] = 0;
+            return;
+        }
+
         case LINUX_SYS_RT_SIGRETURN:
             // we never deliver signals so this shouldn't fire, but handle it cleanly
             cpu->regs[REG_EAX] = 0;
@@ -164,6 +191,7 @@ void dispatch_syscall(i386 *cpu) {
 
         // --- stubs for glibc startup calls we don't need to fully implement ---
 
+
         case 146: // writev
             cpu->regs[REG_EAX] = (uint32_t)sys_writev(cpu, (int)ebx, ecx, (int)edx);
             return;
@@ -174,6 +202,14 @@ void dispatch_syscall(i386 *cpu) {
 
         case 180: // pread64
             cpu->regs[REG_EAX] = (uint32_t)(-ENOSYS);
+            return;
+
+        case 191: // ugetrlimit
+            if (ecx) {
+                mem_write32(ecx,     0xFFFFFFFF); // rlim_cur = RLIM_INFINITY
+                mem_write32(ecx + 4, 0xFFFFFFFF); // rlim_max = RLIM_INFINITY
+            }
+            cpu->regs[REG_EAX] = 0;
             return;
 
         case 195: // stat64 - glibc probes /etc/ld.so.cache and friends
@@ -219,10 +255,45 @@ void dispatch_syscall(i386 *cpu) {
             cpu->regs[REG_EAX] = (uint32_t)sys_open(cpu, ecx, (int)edx, (int)esi);
             return;
 
+        case 300: // fchownat
+            cpu->regs[REG_EAX] = 0;
+            return;
+
+        case 305: // fstatat64
+            cpu->regs[REG_EAX] = (uint32_t)(-2); // ENOENT
+            return;
+
+        case 311: // get_robust_list
+            cpu->regs[REG_EAX] = 0;
+            return;
+
+        case 355: // getrandom
+            if (ebx) {
+                void *buf = guest_to_host(ebx);
+                if (buf) memset(buf, 0xAB, ecx);
+            }
+            cpu->regs[REG_EAX] = ecx;
+            return;
+
+        case 383: // statx
+            cpu->regs[REG_EAX] = (uint32_t)(-38); // ENOSYS
+            return;
+
+        case 403: // clock_gettime64
+            if (ecx) {
+                mem_write32(ecx, 0);
+                mem_write32(ecx + 4, 0);
+                mem_write32(ecx + 8, 0);
+                mem_write32(ecx + 12, 0);
+            }
+            cpu->regs[REG_EAX] = 0;
+            return;
+
+
         default:
             fprintf(stderr, "syscall: unimplemented nr=%u ebx=0x%08X ecx=0x%08X\n",
                     nr, ebx, ecx);
-            g_trace = 1;
+            // g_trace = 1;
             cpu->regs[REG_EAX] = (uint32_t)(-ENOSYS);
             return;
     }

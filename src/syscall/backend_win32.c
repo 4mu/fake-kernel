@@ -139,10 +139,9 @@ static int alloc_fd(void) {
 }
 
 void sys_exit(i386 *cpu, int status) {
-    printf("_dl_phdr=0x%08X _dl_phnum=0x%08X\n",
-               mem_read32(0x80eb724), mem_read32(0x80eb720));
     fprintf(stderr, "sys_exit: guest exited with %d\n", status);
     cpu->halted = 1;
+    printf("total cycles: %d", cpu->cycles);
     exit(status);
 }
 
