@@ -17,12 +17,12 @@ void emulate(i386 *cpu) {
         g_last_eip = cpu->eip;
         uint8_t opcode = mem_read8(cpu->eip);
 
-        if (g_trace && cpu->cycles > 0)
-            fprintf(stderr, "EIP=0x%08X op=0x%02X EAX=0x%08X \n", //EBX=0x%08X ECX=0x%08X EDX=0x%08X ESP=0x%08X\n",
+        if (g_trace)
+            fprintf(stderr, "EIP=0x%08X op=0x%02X EAX=0x%08X EBX=0x%08X ECX=0x%08X EDX=0x%08X ESP=0x%08X\n",
                     cpu->eip, opcode,
-                    cpu->regs[REG_EAX]);//, cpu->regs[REG_EBX],
-                    //cpu->regs[REG_ECX], cpu->regs[REG_EDX],
-                    //cpu->regs[REG_ESP]);
+                    cpu->regs[REG_EAX], cpu->regs[REG_EBX],
+                    cpu->regs[REG_ECX], cpu->regs[REG_EDX],
+                    cpu->regs[REG_ESP]);
 
         cpu->eip++;
         execute_opcode(cpu, opcode);

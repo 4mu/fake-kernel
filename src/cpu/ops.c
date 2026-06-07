@@ -1,7 +1,9 @@
 #include "cpu.h"
 #include "../mem/mem.h"
 #include "../syscall/syscall.h"
+#include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 #define FLAG_CF (1 << 0)
 #define FLAG_PF (1 << 2)
@@ -14,6 +16,17 @@
 static int g_operand_size_16 = 0;
 static uint32_t g_gs_base = 0;
 static uint32_t g_seg_override = 0;
+
+static double fpu_stack[8];
+static int fpu_top = 0;
+
+typedef struct {
+    uint64_t lo;
+    uint64_t hi;
+} XMMReg;
+
+static uint64_t mmx_regs[8];
+static XMMReg xmm_regs[8];
 
 void set_gs_base(uint32_t base) { g_gs_base = base; }
 uint32_t get_gs_base(void) { return g_gs_base; }
@@ -155,6 +168,30 @@ static void write_rm32(i386 *cpu, ModRM *mrm, uint32_t val) {
     else mem_write32(resolve_rm_addr(cpu, mrm), val);
 }
 
+static XMMReg read_xmm_src(i386 *cpu, ModRM *mrm) {
+    XMMReg r;
+    if (mrm->mod == 3) {
+        r = xmm_regs[mrm->rm];
+    } else {
+        uint32_t addr = resolve_rm_addr(cpu, mrm);
+        r.lo = (uint64_t)mem_read32(addr)     | ((uint64_t)mem_read32(addr + 4) << 32);
+        r.hi = (uint64_t)mem_read32(addr + 8) | ((uint64_t)mem_read32(addr + 12) << 32);
+    }
+    return r;
+}
+
+static void write_xmm_dst(i386 *cpu, ModRM *mrm, XMMReg val) {
+    if (mrm->mod == 3) {
+        xmm_regs[mrm->rm] = val;
+    } else {
+        uint32_t addr = resolve_rm_addr(cpu, mrm);
+        mem_write32(addr,      (uint32_t)(val.lo));
+        mem_write32(addr + 4,  (uint32_t)(val.lo >> 32));
+        mem_write32(addr + 8,  (uint32_t)(val.hi));
+        mem_write32(addr + 12, (uint32_t)(val.hi >> 32));
+    }
+}
+
 // opcode handlers
 
 static void op_unimplemented(i386 *cpu, uint8_t opcode) {
@@ -182,6 +219,57 @@ static void op_prefix_cs(i386 *cpu, uint8_t op) {
 }
 
 // 0x0F prefix
+
+// 0x0F 0x10 MOVUPS xmm, xmm/m128
+static void op_movups_xmm_rm128(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    XMMReg src = read_xmm_src(cpu, &mrm);
+    xmm_regs[mrm.reg] = src;
+    cpu->cycles += 3;
+}
+
+// 0x0F 0x11 MOVUPS xmm/m128, xmm
+static void op_movups_rm128_xmm(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    XMMReg src = xmm_regs[mrm.reg];
+    write_xmm_dst(cpu, &mrm, src);
+    cpu->cycles += 3;
+}
+
+// 0x0F 0x16 MOVHPS xmm, m64
+static void op_movhps_xmm_m64(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    if (mrm.mod == 3) {
+        // MOVLHPS xmm, xmm — moves low half of src into high half of dst
+        xmm_regs[mrm.reg].hi = xmm_regs[mrm.rm].lo;
+    } else {
+        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+        xmm_regs[mrm.reg].hi = (uint64_t)mem_read32(addr) | ((uint64_t)mem_read32(addr + 4) << 32);
+    }
+    cpu->cycles += 3;
+}
+
+// 0x0F 0x17 MOVHPS m64, xmm
+static void op_movhps_m64_xmm(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint64_t val = xmm_regs[mrm.reg].hi;
+    if (mrm.mod == 3) {
+        xmm_regs[mrm.rm].lo = val;
+    } else {
+        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+        mem_write32(addr,     (uint32_t)(val));
+        mem_write32(addr + 4, (uint32_t)(val >> 32));
+    }
+    cpu->cycles += 3;
+}
 
 // 0x0F 0x4x CMOVcc r32, r/m32
 static void op_cmovcc(i386 *cpu, uint8_t op) {
@@ -215,34 +303,196 @@ static void op_cmovcc(i386 *cpu, uint8_t op) {
     cpu->cycles += 2;
 }
 
-// 0x0F 0x74-0x7D JCC short
-static void op_jcc_short(i386 *cpu, uint8_t op) {
-    int8_t offset = (int8_t)mem_read8(cpu->eip++);
-    int taken = 0;
-    switch (op) {
-        case 0x70: taken =  get_of(cpu); break; // JO
-        case 0x71: taken = !get_of(cpu); break; // JNO
-        case 0x72: taken =  get_cf(cpu); break; // JB/JNAE
-        case 0x73: taken = !get_cf(cpu); break; // JNB/JAE
-        case 0x74: taken =  get_zf(cpu); break; // JE/JZ
-        case 0x75: taken = !get_zf(cpu); break; // JNE/JNZ
-        case 0x76: taken =  get_cf(cpu) || get_zf(cpu);  break; // JBE
-        case 0x77: taken = !get_cf(cpu) && !get_zf(cpu); break; // JA
-        case 0x78: taken =  get_sf(cpu); break; // JS
-        case 0x79: taken = !get_sf(cpu); break; // JNS
-        case 0x7A: taken =  get_pf(cpu); break; // JP stub, parity flag not implemented
-        case 0x7B: taken = !get_pf(cpu); break; // JNP stub
-        case 0x7C: taken =  get_sf(cpu) != get_of(cpu); break; // JL
-        case 0x7D: taken =  get_sf(cpu) == get_of(cpu); break; // JGE
-        case 0x7E: taken =  get_zf(cpu) || (get_sf(cpu) != get_of(cpu)); break; // JLE
-        case 0x7F: taken = !get_zf(cpu) && (get_sf(cpu) == get_of(cpu)); break; // JG
-        default:
-            fprintf(stderr, "unhandled Jcc short op=0x%02X\n", op);
-            cpu->halted = 1;
-            return;
+// 0x0F 0x60 PUNPCKLBW mm, mm/m64
+static void op_punpcklbw(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint64_t src;
+    if (mrm.mod == 3) {
+        src = mmx_regs[mrm.rm];
+    } else {
+        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+        src = (uint64_t)mem_read32(addr) | ((uint64_t)mem_read32(addr + 4) << 32);
     }
-    if (taken) cpu->eip += offset;
-    cpu->cycles += 1;
+    uint64_t dst = mmx_regs[mrm.reg];
+    uint64_t result =
+        ((dst >>  0) & 0xFF)        |
+        (((src >>  0) & 0xFF) <<  8) |
+        (((dst >>  8) & 0xFF) << 16) |
+        (((src >>  8) & 0xFF) << 24) |
+        (((dst >> 16) & 0xFF) << 32) |
+        (((src >> 16) & 0xFF) << 40) |
+        (((dst >> 24) & 0xFF) << 48) |
+        (((src >> 24) & 0xFF) << 56);
+    mmx_regs[mrm.reg] = result;
+    cpu->cycles += 3;
+}
+
+// 0x0F 0x61 PUNPCKLWD mm, mm/m64
+static void op_punpcklwd(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint64_t src;
+    if (mrm.mod == 3) {
+        src = mmx_regs[mrm.rm];
+    } else {
+        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+        src = (uint64_t)mem_read32(addr) | ((uint64_t)mem_read32(addr + 4) << 32);
+    }
+    uint64_t dst = mmx_regs[mrm.reg];
+    uint64_t result =
+        ((dst >>  0) & 0xFFFF)        |
+        (((src >>  0) & 0xFFFF) << 16) |
+        (((dst >> 16) & 0xFFFF) << 32) |
+        (((src >> 16) & 0xFFFF) << 48);
+    mmx_regs[mrm.reg] = result;
+    cpu->cycles += 3;
+}
+
+// 0x0F 0x62 PUNPCKLDQ mm, mm/m64
+static void op_punpckldq(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint64_t src;
+    if (mrm.mod == 3) {
+        src = mmx_regs[mrm.rm];
+    } else {
+        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+        src = (uint64_t)mem_read32(addr) | ((uint64_t)mem_read32(addr + 4) << 32);
+    }
+    uint64_t dst = mmx_regs[mrm.reg];
+    uint64_t result =
+        (dst & 0x00000000FFFFFFFF) |
+        ((src & 0x00000000FFFFFFFF) << 32);
+    mmx_regs[mrm.reg] = result;
+    cpu->cycles += 3;
+}
+
+// 0x0F 0x6C PUNPCKLQDQ xmm, xmm/m128 (SSE2, requires 0x66 prefix)
+static void op_punpcklqdq(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    XMMReg src = read_xmm_src(cpu, &mrm);
+    xmm_regs[mrm.reg].hi = src.lo;
+    cpu->cycles += 3;
+}
+
+// 0x0F 0x6D PUNPCKHQDQ xmm, xmm/m128 (SSE2, requires 0x66 prefix)
+static void op_punpckhqdq(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    XMMReg src = read_xmm_src(cpu, &mrm);
+    xmm_regs[mrm.reg].lo = xmm_regs[mrm.reg].hi;
+    xmm_regs[mrm.reg].hi = src.hi;
+    cpu->cycles += 3;
+}
+
+// 0x0F 0x6E MOVD mm, r/m32
+static void op_movd_mm_rm32(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint32_t val = read_rm32(cpu, &mrm);
+    mmx_regs[mrm.reg] = (uint64_t)val;
+    cpu->cycles += 3;
+}
+
+// 0x0F 0x6F MOVQ mm, mm/m64
+static void op_movq_mm_rm64(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint64_t val;
+    if (mrm.mod == 3) {
+        val = mmx_regs[mrm.rm];
+    } else {
+        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+        val = (uint64_t)mem_read32(addr) | ((uint64_t)mem_read32(addr + 4) << 32);
+    }
+    mmx_regs[mrm.reg] = val;
+    cpu->cycles += 3;
+}
+
+// 0x0F 0x70 PSHUFW mm, mm/m64, imm8
+static void op_pshufw(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint64_t src;
+    if (mrm.mod == 3) {
+        src = mmx_regs[mrm.rm];
+    } else {
+        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+        src = (uint64_t)mem_read32(addr) | ((uint64_t)mem_read32(addr + 4) << 32);
+    }
+    uint8_t imm = mem_read8(cpu->eip++);
+    uint16_t words[4];
+    words[0] = (uint16_t)(src >>  0);
+    words[1] = (uint16_t)(src >> 16);
+    words[2] = (uint16_t)(src >> 32);
+    words[3] = (uint16_t)(src >> 48);
+    uint64_t result =
+        ((uint64_t)words[(imm >>  0) & 3]      ) |
+        ((uint64_t)words[(imm >>  2) & 3] << 16) |
+        ((uint64_t)words[(imm >>  4) & 3] << 32) |
+        ((uint64_t)words[(imm >>  6) & 3] << 48);
+    mmx_regs[mrm.reg] = result;
+    cpu->cycles += 3;
+}
+
+// 0x0F 0x74 PCMPEQB mm, mm/m64
+static void op_pcmpeqb(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint64_t src;
+    if (mrm.mod == 3) {
+        src = mmx_regs[mrm.rm];
+    } else {
+        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+        src = (uint64_t)mem_read32(addr) | ((uint64_t)mem_read32(addr + 4) << 32);
+    }
+    uint64_t dst = mmx_regs[mrm.reg];
+    uint64_t result = 0;
+    for (int i = 0; i < 8; i++) {
+        uint8_t a = (uint8_t)(dst >> (i * 8));
+        uint8_t b = (uint8_t)(src >> (i * 8));
+        uint8_t r = (a == b) ? 0xFF : 0x00;
+        result |= (uint64_t)r << (i * 8);
+    }
+    mmx_regs[mrm.reg] = result;
+    cpu->cycles += 3;
+}
+
+// 0x0F 0x7E MOVD r/m32, mm
+static void op_movd_rm32_mm(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint32_t val = (uint32_t)(mmx_regs[mrm.reg] & 0xFFFFFFFF);
+    write_rm32(cpu, &mrm, val);
+    cpu->cycles += 3;
+}
+
+// 0x0F 0x7F MOVQ mm/m64, mm
+static void op_movq_rm64_mm2(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint64_t val = mmx_regs[mrm.reg];
+    if (mrm.mod == 3) {
+        mmx_regs[mrm.rm] = val;
+    } else {
+        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+        mem_write32(addr,     (uint32_t)(val));
+        mem_write32(addr + 4, (uint32_t)(val >> 32));
+    }
+    cpu->cycles += 3;
 }
 
 // 0x0F 0x8x JCC near
@@ -261,6 +511,8 @@ static void op_jcc_near(i386 *cpu, uint8_t op) {
         case 0x87: taken = !get_cf(cpu) && !get_zf(cpu); break; // JA
         case 0x88: taken =  get_sf(cpu); break; // JS
         case 0x89: taken = !get_sf(cpu); break; // JNS
+        case 0x8A: taken =  get_pf(cpu); break; // JP
+        case 0x8B: taken = !get_pf(cpu); break; // JNP
         case 0x8C: taken =  get_sf(cpu) != get_of(cpu); break; // JL
         case 0x8D: taken =  get_sf(cpu) == get_of(cpu); break; // JGE
         case 0x8E: taken =  get_zf(cpu) || (get_sf(cpu) != get_of(cpu)); break; // JLE
@@ -369,6 +621,25 @@ static void op_cpuid(i386 *cpu, uint8_t op) {
     cpu->cycles += 10;
 }
 
+// 0x0F 0xA4 SHLD r/m32, r32, imm8
+static void op_shld_rm32_r32_imm8(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint8_t count = mem_read8(cpu->eip++) & 0x1F;
+    uint32_t dst = read_rm32(cpu, &mrm);
+    uint32_t src = cpu->regs[mrm.reg];
+    if (count == 0) return;
+    uint32_t result = (dst << count) | (src >> (32 - count));
+    write_rm32(cpu, &mrm, result);
+    set_cf(cpu, (dst >> (32 - count)) & 1);
+    set_zf(cpu, result);
+    set_sf(cpu, result);
+    set_pf(cpu, result);
+    set_of_sub(cpu, dst, src, result);
+    cpu->cycles += 3;
+}
+
 // 0x0F 0xAF IMUL r32, r/m32
 static void op_imul_r32_rm32(i386 *cpu, uint8_t op) {
     (void)op;
@@ -428,7 +699,98 @@ static void op_movzx_r32_rm16(i386 *cpu, uint8_t op) {
     cpu->cycles += 2;
 }
 
+// 0x0F 0xBE MOVSX r32, r/m8
+static void op_movsx_r32_rm8(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint8_t val = (mrm.mod == 3)
+        ? get_reg8(cpu, mrm.rm)
+        : mem_read8(resolve_rm_addr(cpu, &mrm));
+    cpu->regs[mrm.reg] = (uint32_t)(int32_t)(int8_t)val;
+    cpu->cycles += 2;
+}
+
+// 0x0F 0xBF MOVSX r32, r/m16
+static void op_movsx_r32_rm16(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint16_t val = (mrm.mod == 3)
+        ? (uint16_t)cpu->regs[mrm.rm]
+        : mem_read16(resolve_rm_addr(cpu, &mrm));
+    cpu->regs[mrm.reg] = (uint32_t)(int32_t)(int16_t)val;
+    cpu->cycles += 2;
+}
+
+// 0x0F 0xD6 MOVQ mm/m64, mm
+static void op_movq_rm64_mm(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint64_t val = mmx_regs[mrm.reg];
+    if (mrm.mod == 3) {
+        mmx_regs[mrm.rm] = val;
+    } else {
+        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+        mem_write32(addr,     (uint32_t)(val));
+        mem_write32(addr + 4, (uint32_t)(val >> 32));
+    }
+    cpu->cycles += 3;
+}
+
+// 0x0F 0xD7 PMOVMSKB r32, mm
+static void op_pmovmskb(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint64_t src = mmx_regs[mrm.rm];
+    uint32_t mask = 0;
+    for (int i = 0; i < 8; i++) {
+        if ((src >> (i * 8 + 7)) & 1)
+            mask |= (1u << i);
+    }
+    cpu->regs[mrm.reg] = mask;
+    cpu->cycles += 3;
+}
+
+// 0x0F 0xEF PXOR mm, mm/m64
+static void op_pxor_mm_mm(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint64_t src;
+    if (mrm.mod == 3) {
+        src = mmx_regs[mrm.rm];
+    } else {
+        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+        src = (uint64_t)mem_read32(addr) | ((uint64_t)mem_read32(addr + 4) << 32);
+    }
+    mmx_regs[mrm.reg] ^= src;
+    cpu->cycles += 3;
+}
+
 // 0x00-0xFF opcodes
+
+// 0x00 ADD r/m8, r8
+static void op_add_rm8_r8(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint8_t a = (mrm.mod == 3)
+        ? get_reg8(cpu, mrm.rm)
+        : mem_read8(resolve_rm_addr(cpu, &mrm));
+    uint8_t b = get_reg8(cpu, mrm.reg);
+    uint8_t result = a + b;
+    if (mrm.mod == 3) set_reg8(cpu, mrm.rm, result);
+    else mem_write8(resolve_rm_addr(cpu, &mrm), result);
+    set_cf(cpu, result < a);
+    set_zf(cpu, (uint32_t)result);
+    set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
+    set_of_add(cpu, a, b, result);
+    cpu->cycles += 2;
+}
 
 // 0x01 ADD r/m32, r32
 static void op_add_rm32_r32(i386 *cpu, uint8_t op) {
@@ -442,6 +804,25 @@ static void op_add_rm32_r32(i386 *cpu, uint8_t op) {
     set_cf(cpu, result < a);
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
+    set_of_add(cpu, a, b, result);
+    cpu->cycles += 2;
+}
+
+// 0x02 ADD r8, r/m8
+static void op_add_r8_rm8(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint8_t a = get_reg8(cpu, mrm.reg);
+    uint8_t b = (mrm.mod == 3)
+        ? get_reg8(cpu, mrm.rm)
+        : mem_read8(resolve_rm_addr(cpu, &mrm));
+    uint8_t result = a + b;
+    set_reg8(cpu, mrm.reg, result);
+    set_cf(cpu, result < a);
+    set_zf(cpu, (uint32_t)result);
+    set_sf(cpu, (uint32_t)result);
     set_pf(cpu, (uint32_t)result);
     set_of_add(cpu, a, b, result);
     cpu->cycles += 2;
@@ -510,6 +891,47 @@ static void op_or_rm32_r32(i386 *cpu, uint8_t op) {
     cpu->cycles += 2;
 }
 
+// 0x10 ADC r/m8, r8
+static void op_adc_rm8_r8(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint8_t a = (mrm.mod == 3)
+        ? get_reg8(cpu, mrm.rm)
+        : mem_read8(resolve_rm_addr(cpu, &mrm));
+    uint8_t b = get_reg8(cpu, mrm.reg);
+    uint8_t cf = (uint8_t)get_cf(cpu);
+    uint8_t result = a + b + cf;
+    if (mrm.mod == 3) set_reg8(cpu, mrm.rm, result);
+    else mem_write8(resolve_rm_addr(cpu, &mrm), result);
+    set_cf(cpu, result < a || (cf && result == a));
+    set_zf(cpu, (uint32_t)result);
+    set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
+    set_of_add(cpu, a, b, result);
+    cpu->cycles += 2;
+}
+
+// 0x12 ADC r8, r/m8
+static void op_adc_r8_rm8(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint8_t a = get_reg8(cpu, mrm.reg);
+    uint8_t b = (mrm.mod == 3)
+        ? get_reg8(cpu, mrm.rm)
+        : mem_read8(resolve_rm_addr(cpu, &mrm));
+    uint8_t cf = (uint8_t)get_cf(cpu);
+    uint8_t result = a + b + cf;
+    set_reg8(cpu, mrm.reg, result);
+    set_cf(cpu, result < a || (cf && result == a));
+    set_zf(cpu, (uint32_t)result);
+    set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
+    set_of_add(cpu, a, b, result);
+    cpu->cycles += 2;
+}
+
 // 0x0B OR r32, r/m32
 static void op_or_r32_rm32(i386 *cpu, uint8_t op) {
     (void)op;
@@ -522,6 +944,20 @@ static void op_or_r32_rm32(i386 *cpu, uint8_t op) {
     set_cf(cpu, 0);
     set_pf(cpu, (uint32_t)result);
     cpu->cycles += 2;
+}
+
+// 0x0C OR AL, imm8
+static void op_or_al_imm8(i386 *cpu, uint8_t op) {
+    (void)op;
+    uint8_t a = (uint8_t)cpu->regs[REG_EAX];
+    uint8_t b = mem_read8(cpu->eip++);
+    uint8_t result = a | b;
+    set_reg8(cpu, REG_EAX, result);
+    set_zf(cpu, (uint32_t)result);
+    set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
+    set_cf(cpu, 0);
+    cpu->cycles += 1;
 }
 
 // 0x0D OR EAX, imm32
@@ -610,6 +1046,25 @@ static void op_sbb_r32_rm32(i386 *cpu, uint8_t op) {
     cpu->cycles += 2;
 }
 
+// 0x20 AND r/m8, r8
+static void op_and_rm8_r8(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint8_t a = (mrm.mod == 3)
+        ? get_reg8(cpu, mrm.rm)
+        : mem_read8(resolve_rm_addr(cpu, &mrm));
+    uint8_t b = get_reg8(cpu, mrm.reg);
+    uint8_t result = a & b;
+    if (mrm.mod == 3) set_reg8(cpu, mrm.rm, result);
+    else mem_write8(resolve_rm_addr(cpu, &mrm), result);
+    set_zf(cpu, (uint32_t)result);
+    set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
+    set_cf(cpu, 0);
+    cpu->cycles += 2;
+}
+
 // 0x21 AND r/m32, r32
 static void op_and_rm32_r32(i386 *cpu, uint8_t op) {
     (void)op;
@@ -619,6 +1074,24 @@ static void op_and_rm32_r32(i386 *cpu, uint8_t op) {
     write_rm32(cpu, &mrm, result);
     set_zf(cpu, result);
     set_sf(cpu, result);
+    set_pf(cpu, (uint32_t)result);
+    set_cf(cpu, 0);
+    cpu->cycles += 2;
+}
+
+// 0x22 AND r8, r/m8
+static void op_and_r8_rm8(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint8_t a = get_reg8(cpu, mrm.reg);
+    uint8_t b = (mrm.mod == 3)
+        ? get_reg8(cpu, mrm.rm)
+        : mem_read8(resolve_rm_addr(cpu, &mrm));
+    uint8_t result = a & b;
+    set_reg8(cpu, mrm.reg, result);
+    set_zf(cpu, (uint32_t)result);
+    set_sf(cpu, (uint32_t)result);
     set_pf(cpu, (uint32_t)result);
     set_cf(cpu, 0);
     cpu->cycles += 2;
@@ -636,6 +1109,20 @@ static void op_and_r32_rm32(i386 *cpu, uint8_t op) {
     set_pf(cpu, (uint32_t)result);
     set_cf(cpu, 0);
     cpu->cycles += 2;
+}
+
+// 0x24 AND AL, imm8
+static void op_and_al_imm8(i386 *cpu, uint8_t op) {
+    (void)op;
+    uint8_t a = (uint8_t)cpu->regs[REG_EAX];
+    uint8_t b = mem_read8(cpu->eip++);
+    uint8_t result = a & b;
+    set_reg8(cpu, REG_EAX, result);
+    set_zf(cpu, (uint32_t)result);
+    set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
+    set_cf(cpu, 0);
+    cpu->cycles += 1;
 }
 
 // 0x25 AND EAX, imm32
@@ -686,6 +1173,41 @@ static void op_sub_r32_rm32(i386 *cpu, uint8_t op) {
     cpu->cycles += 2;
 }
 
+// 0x2D SUB EAX, imm32
+static void op_sub_eax_imm32(i386 *cpu, uint8_t op) {
+    (void)op;
+    uint32_t a = cpu->regs[REG_EAX];
+    uint32_t b = mem_read32(cpu->eip);
+    cpu->eip += 4;
+    uint32_t result = a - b;
+    cpu->regs[REG_EAX] = result;
+    set_cf(cpu, a < b);
+    set_zf(cpu, result);
+    set_sf(cpu, result);
+    set_pf(cpu, result);
+    set_of_sub(cpu, a, b, result);
+    cpu->cycles += 1;
+}
+
+// 0x30 XOR r/m8, r8
+static void op_xor_rm8_r8(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint8_t a = (mrm.mod == 3)
+        ? get_reg8(cpu, mrm.rm)
+        : mem_read8(resolve_rm_addr(cpu, &mrm));
+    uint8_t b = get_reg8(cpu, mrm.reg);
+    uint8_t result = a ^ b;
+    if (mrm.mod == 3) set_reg8(cpu, mrm.rm, result);
+    else mem_write8(resolve_rm_addr(cpu, &mrm), result);
+    set_zf(cpu, (uint32_t)result);
+    set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
+    set_cf(cpu, 0);
+    cpu->cycles += 2;
+}
+
 // 0x31 XOR r/m32, r32
 static void op_xor_rm32_r32(i386 *cpu, uint8_t op) {
     (void)op;
@@ -711,6 +1233,20 @@ static void op_xor_r32_rm32(i386 *cpu, uint8_t op) {
     set_pf(cpu, (uint32_t)result);
     set_cf(cpu, 0);
     cpu->cycles += 2;
+}
+
+// 0x34 XOR AL, imm8
+static void op_xor_al_imm8(i386 *cpu, uint8_t op) {
+    (void)op;
+    uint8_t a = (uint8_t)cpu->regs[REG_EAX];
+    uint8_t b = mem_read8(cpu->eip++);
+    uint8_t result = a ^ b;
+    set_reg8(cpu, REG_EAX, result);
+    set_zf(cpu, (uint32_t)result);
+    set_sf(cpu, (uint32_t)result);
+    set_pf(cpu, (uint32_t)result);
+    set_cf(cpu, 0);
+    cpu->cycles += 1;
 }
 
 // 0x38 CMP r/m8, r8
@@ -874,6 +1410,14 @@ static void op_prefix_66(i386 *cpu, uint8_t op) {
     g_operand_size_16 = 0;
 }
 
+// 0x67 address size override prefix
+static void op_prefix_67(i386 *cpu, uint8_t op) {
+    (void)op;
+    uint8_t next = mem_read8(cpu->eip++);
+    execute_opcode(cpu, next);
+    cpu->cycles += 1;
+}
+
 // 0x68 PUSH imm32
 static void op_push_imm32(i386 *cpu, uint8_t op) {
     (void)op;
@@ -920,6 +1464,36 @@ static void op_imul_r32_rm32_imm8(i386 *cpu, uint8_t op) {
     set_zf(cpu, (uint32_t)result);
     set_sf(cpu, (uint32_t)result);
     cpu->cycles += 10;
+}
+
+// 0x74-0x7D JCC short
+static void op_jcc_short(i386 *cpu, uint8_t op) {
+    int8_t offset = (int8_t)mem_read8(cpu->eip++);
+    int taken = 0;
+    switch (op) {
+        case 0x70: taken =  get_of(cpu); break; // JO
+        case 0x71: taken = !get_of(cpu); break; // JNO
+        case 0x72: taken =  get_cf(cpu); break; // JB/JNAE
+        case 0x73: taken = !get_cf(cpu); break; // JNB/JAE
+        case 0x74: taken =  get_zf(cpu); break; // JE/JZ
+        case 0x75: taken = !get_zf(cpu); break; // JNE/JNZ
+        case 0x76: taken =  get_cf(cpu) || get_zf(cpu);  break; // JBE
+        case 0x77: taken = !get_cf(cpu) && !get_zf(cpu); break; // JA
+        case 0x78: taken =  get_sf(cpu); break; // JS
+        case 0x79: taken = !get_sf(cpu); break; // JNS
+        case 0x7A: taken =  get_pf(cpu); break; // JP stub, parity flag not implemented
+        case 0x7B: taken = !get_pf(cpu); break; // JNP stub
+        case 0x7C: taken =  get_sf(cpu) != get_of(cpu); break; // JL
+        case 0x7D: taken =  get_sf(cpu) == get_of(cpu); break; // JGE
+        case 0x7E: taken =  get_zf(cpu) || (get_sf(cpu) != get_of(cpu)); break; // JLE
+        case 0x7F: taken = !get_zf(cpu) && (get_sf(cpu) == get_of(cpu)); break; // JG
+        default:
+            fprintf(stderr, "unhandled Jcc short op=0x%02X\n", op);
+            cpu->halted = 1;
+            return;
+    }
+    if (taken) cpu->eip += offset;
+    cpu->cycles += 1;
 }
 
 // 0x80 group: ADD/OR/AND/SUB/XOR/CMP r/m8, imm8
@@ -997,6 +1571,42 @@ static void op_81(i386 *cpu, uint8_t op) {
     (void)op;
     ModRM mrm;
     parse_modrm(cpu, &mrm);
+
+    if (g_operand_size_16) {
+        uint16_t imm = mem_read16(cpu->eip);
+        cpu->eip += 2;
+        uint16_t a = (mrm.mod == 3)
+            ? (uint16_t)cpu->regs[mrm.rm]
+            : mem_read16(resolve_rm_addr(cpu, &mrm));
+        uint16_t result = 0;
+        switch (mrm.reg) {
+            case 0: result = a + imm; break;
+            case 1: result = a | imm; break;
+            case 4: result = a & imm; break;
+            case 5: result = a - imm; break;
+            case 6: result = a ^ imm; break;
+            case 7: // CMP
+                result = a - imm;
+                set_cf(cpu, a < imm);
+                set_zf(cpu, (uint32_t)result);
+                set_sf(cpu, (uint32_t)(result << 16));
+                cpu->cycles += 2;
+                return;
+            default:
+                fprintf(stderr, "unhandled 0x66 0x81 reg=%d\n", mrm.reg);
+                cpu->halted = 1;
+                return;
+        }
+        if (mrm.mod == 3)
+            cpu->regs[mrm.rm] = (cpu->regs[mrm.rm] & 0xFFFF0000) | result;
+        else
+            mem_write16(resolve_rm_addr(cpu, &mrm), result);
+        set_zf(cpu, (uint32_t)result);
+        set_sf(cpu, (uint32_t)(result << 16));
+        cpu->cycles += 2;
+        return;
+    }
+
     uint32_t imm = mem_read32(cpu->eip);
     cpu->eip += 4;
     uint32_t a = read_rm32(cpu, &mrm);
@@ -1049,7 +1659,43 @@ static void op_83(i386 *cpu, uint8_t op) {
     (void)op;
     ModRM mrm;
     parse_modrm(cpu, &mrm);
-    uint32_t imm = (uint32_t)(int32_t)(int8_t)mem_read8(cpu->eip++);
+    int8_t raw = (int8_t)mem_read8(cpu->eip++);
+    uint32_t imm = (uint32_t)(int32_t)raw;
+
+    if (g_operand_size_16) {
+        uint16_t imm16 = (uint16_t)(int16_t)raw;
+        uint16_t a = (mrm.mod == 3)
+            ? (uint16_t)cpu->regs[mrm.rm]
+            : mem_read16(resolve_rm_addr(cpu, &mrm));
+        uint16_t result = 0;
+        switch (mrm.reg) {
+            case 0: result = a + imm16; break;
+            case 1: result = a | imm16; break;
+            case 4: result = a & imm16; break;
+            case 5: result = a - imm16; break;
+            case 6: result = a ^ imm16; break;
+            case 7:
+                result = a - imm16;
+                set_cf(cpu, a < imm16);
+                set_zf(cpu, (uint32_t)result);
+                set_sf(cpu, (uint32_t)(result << 16));
+                cpu->cycles += 2;
+                return;
+            default:
+                fprintf(stderr, "unhandled 0x66 0x83 reg=%d\n", mrm.reg);
+                cpu->halted = 1;
+                return;
+        }
+        if (mrm.mod == 3)
+            cpu->regs[mrm.rm] = (cpu->regs[mrm.rm] & 0xFFFF0000) | result;
+        else
+            mem_write16(resolve_rm_addr(cpu, &mrm), result);
+        set_zf(cpu, (uint32_t)result);
+        set_sf(cpu, (uint32_t)(result << 16));
+        cpu->cycles += 2;
+        return;
+    }
+
     uint32_t a = read_rm32(cpu, &mrm);
     uint32_t result = 0;
     switch (mrm.reg) {
@@ -1063,6 +1709,18 @@ static void op_83(i386 *cpu, uint8_t op) {
             result = a | imm;
             write_rm32(cpu, &mrm, result);
             set_cf(cpu, 0);
+            break;
+        case 2:
+            result = a + imm + get_cf(cpu);
+            write_rm32(cpu, &mrm, result);
+            set_cf(cpu, result < a);
+            set_of_add(cpu, a, imm, result);
+            break;
+        case 3:
+            result = a - imm - get_cf(cpu);
+            write_rm32(cpu, &mrm, result);
+            set_cf(cpu, a < imm + get_cf(cpu));
+            set_of_sub(cpu, a, imm, result);
             break;
         case 4:
             result = a & imm;
@@ -1224,6 +1882,13 @@ static void op_xchg_eax_r32(i386 *cpu, uint8_t op) {
     cpu->cycles += 2;
 }
 
+// 0x99 CDQ - sign extend EAX into EDX:EAX
+static void op_cdq(i386 *cpu, uint8_t op) {
+    (void)op;
+    cpu->regs[REG_EDX] = (cpu->regs[REG_EAX] & 0x80000000) ? 0xFFFFFFFF : 0;
+    cpu->cycles += 1;
+}
+
 // 0xA1 MOV EAX, [imm32]
 static void op_mov_eax_mem(i386 *cpu, uint8_t op) {
     (void)op;
@@ -1352,6 +2017,57 @@ static void op_mov_r32_imm32(i386 *cpu, uint8_t op) {
     cpu->cycles += 1;
 }
 
+// 0xC0 shift group: ROL/ROR/SHL/SHR/SAR r/m8, imm8
+static void op_c0_group(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint8_t count = mem_read8(cpu->eip++) & 0x1F;
+    uint8_t val = (mrm.mod == 3)
+        ? get_reg8(cpu, mrm.rm)
+        : mem_read8(resolve_rm_addr(cpu, &mrm));
+    uint8_t result = 0;
+
+    switch (mrm.reg) {
+        case 0: // ROL
+            result = (val << count) | (val >> (8 - count));
+            set_cf(cpu, result & 1);
+            break;
+        case 1: // ROR
+            result = (val >> count) | (val << (8 - count));
+            set_cf(cpu, (result >> 7) & 1);
+            break;
+        case 4: // SHL
+        case 6:
+            result = val << count;
+            set_cf(cpu, count ? (val >> (8 - count)) & 1 : 0);
+            set_zf(cpu, (uint32_t)result);
+            set_sf(cpu, (uint32_t)result);
+            break;
+        case 5: // SHR
+            result = val >> count;
+            set_cf(cpu, count ? (val >> (count - 1)) & 1 : 0);
+            set_zf(cpu, (uint32_t)result);
+            set_sf(cpu, (uint32_t)result);
+            break;
+        case 7: // SAR
+            result = (uint8_t)((int8_t)val >> count);
+            set_cf(cpu, count ? (val >> (count - 1)) & 1 : 0);
+            set_zf(cpu, (uint32_t)result);
+            set_sf(cpu, (uint32_t)result);
+            break;
+        default:
+            fprintf(stderr, "unhandled 0xC0 reg=%d at EIP 0x%08X\n", mrm.reg, cpu->eip);
+            cpu->halted = 1;
+            return;
+    }
+
+    if (mrm.mod == 3) set_reg8(cpu, mrm.rm, result);
+    else mem_write8(resolve_rm_addr(cpu, &mrm), result);
+    set_pf(cpu, (uint32_t)result);
+    cpu->cycles += 2;
+}
+
 // 0xC1 shift group: ROL/ROR/SHL/SHR/SAR r/m32, imm8
 static void op_c1_group(i386 *cpu, uint8_t op) {
     (void)op;
@@ -1402,6 +2118,16 @@ static void op_c1_group(i386 *cpu, uint8_t op) {
 
     write_rm32(cpu, &mrm, result);
     cpu->cycles += 2;
+}
+
+// 0xC2 RET imm16 - return and pop N bytes
+static void op_ret_imm16(i386 *cpu, uint8_t op) {
+    (void)op;
+    uint16_t imm = mem_read16(cpu->eip);
+    cpu->eip += 2;
+    cpu->eip = mem_read32(cpu->regs[REG_ESP]);
+    cpu->regs[REG_ESP] += 4 + imm;
+    cpu->cycles += 5;
 }
 
 // 0xC3 RET
@@ -1465,6 +2191,56 @@ static void op_int(i386 *cpu, uint8_t op) {
     cpu->cycles += 50;
 }
 
+// 0xD0 shift group: ROL/ROR/SHL/SHR/SAR r/m8, 1
+static void op_d0_group(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint8_t val = (mrm.mod == 3)
+        ? get_reg8(cpu, mrm.rm)
+        : mem_read8(resolve_rm_addr(cpu, &mrm));
+    uint8_t result = 0;
+
+    switch (mrm.reg) {
+        case 0: // ROL
+            result = (val << 1) | (val >> 7);
+            set_cf(cpu, result & 1);
+            break;
+        case 1: // ROR
+            result = (val >> 1) | (val << 7);
+            set_cf(cpu, (result >> 7) & 1);
+            break;
+        case 4: // SHL
+        case 6:
+            set_cf(cpu, (val >> 7) & 1);
+            result = val << 1;
+            set_zf(cpu, (uint32_t)result);
+            set_sf(cpu, (uint32_t)result);
+            break;
+        case 5: // SHR
+            set_cf(cpu, val & 1);
+            result = val >> 1;
+            set_zf(cpu, (uint32_t)result);
+            set_sf(cpu, (uint32_t)result);
+            break;
+        case 7: // SAR
+            set_cf(cpu, val & 1);
+            result = (uint8_t)((int8_t)val >> 1);
+            set_zf(cpu, (uint32_t)result);
+            set_sf(cpu, (uint32_t)result);
+            break;
+        default:
+            fprintf(stderr, "unhandled 0xD0 reg=%d at EIP 0x%08X\n", mrm.reg, cpu->eip);
+            cpu->halted = 1;
+            return;
+    }
+
+    if (mrm.mod == 3) set_reg8(cpu, mrm.rm, result);
+    else mem_write8(resolve_rm_addr(cpu, &mrm), result);
+    set_pf(cpu, (uint32_t)result);
+    cpu->cycles += 2;
+}
+
 // 0xD1 shift group: ROL/ROR/SHL/SHR/SAR r/m32, 1
 static void op_d1_group(i386 *cpu, uint8_t op) {
     (void)op;
@@ -1513,6 +2289,57 @@ static void op_d1_group(i386 *cpu, uint8_t op) {
     }
 
     write_rm32(cpu, &mrm, result);
+    cpu->cycles += 2;
+}
+
+// 0xD2 shift group: ROL/ROR/SHL/SHR/SAR r/m8, CL
+static void op_d2_group(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+    uint8_t count = cpu->regs[REG_ECX] & 0x1F;
+    uint8_t val = (mrm.mod == 3)
+        ? get_reg8(cpu, mrm.rm)
+        : mem_read8(resolve_rm_addr(cpu, &mrm));
+    uint8_t result = 0;
+
+    switch (mrm.reg) {
+        case 0: // ROL
+            result = (val << count) | (val >> (8 - count));
+            set_cf(cpu, result & 1);
+            break;
+        case 1: // ROR
+            result = (val >> count) | (val << (8 - count));
+            set_cf(cpu, (result >> 7) & 1);
+            break;
+        case 4: // SHL
+        case 6:
+            result = val << count;
+            set_cf(cpu, count ? (val >> (8 - count)) & 1 : 0);
+            set_zf(cpu, (uint32_t)result);
+            set_sf(cpu, (uint32_t)result);
+            break;
+        case 5: // SHR
+            result = val >> count;
+            set_cf(cpu, count ? (val >> (count - 1)) & 1 : 0);
+            set_zf(cpu, (uint32_t)result);
+            set_sf(cpu, (uint32_t)result);
+            break;
+        case 7: // SAR
+            result = (uint8_t)((int8_t)val >> count);
+            set_cf(cpu, count ? (val >> (count - 1)) & 1 : 0);
+            set_zf(cpu, (uint32_t)result);
+            set_sf(cpu, (uint32_t)result);
+            break;
+        default:
+            fprintf(stderr, "unhandled 0xD2 reg=%d at EIP 0x%08X\n", mrm.reg, cpu->eip);
+            cpu->halted = 1;
+            return;
+    }
+
+    if (mrm.mod == 3) set_reg8(cpu, mrm.rm, result);
+    else mem_write8(resolve_rm_addr(cpu, &mrm), result);
+    set_pf(cpu, (uint32_t)result);
     cpu->cycles += 2;
 }
 
@@ -1568,6 +2395,413 @@ static void op_d3_group(i386 *cpu, uint8_t op) {
     cpu->cycles += 2;
 }
 
+// 0xD9 x87 escape
+static void op_d9(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+
+    if (mrm.mod == 3) {
+        // register form — the actual opcode is encoded in rm
+        switch (mrm.reg) {
+            case 0: // FLD ST(i)
+                fpu_top = (fpu_top - 1) & 7;
+                fpu_stack[fpu_top] = fpu_stack[(fpu_top + 1 + mrm.rm) & 7];
+                cpu->cycles += 3;
+                break;
+            case 1: // FXCH ST(i)
+                {
+                    double tmp = fpu_stack[fpu_top];
+                    fpu_stack[fpu_top] = fpu_stack[(fpu_top + mrm.rm) & 7];
+                    fpu_stack[(fpu_top + mrm.rm) & 7] = tmp;
+                }
+                cpu->cycles += 3;
+                break;
+            case 4: // FLDZ, FLD1, FLDPI etc
+                switch (mrm.rm) {
+                    case 0: // FCHS
+                        fpu_stack[fpu_top] = -fpu_stack[fpu_top];
+                        break;
+                    case 1: // FABS
+                        fpu_stack[fpu_top] = fpu_stack[fpu_top] < 0
+                            ? -fpu_stack[fpu_top] : fpu_stack[fpu_top];
+                        break;
+                    case 4: // FTST
+                        cpu->cycles += 3;
+                        break;
+                    case 5: // FXAM
+                        cpu->cycles += 3;
+                        break;
+                    default:
+                        cpu->cycles += 3;
+                        break;
+                }
+                cpu->cycles += 3;
+                break;
+            case 5: // FLD1, FLDL2T, FLDL2E, FLDPI, FLDLG2, FLDLN2, FLDZ
+                switch (mrm.rm) {
+                    case 0: // FLD1
+                        fpu_top = (fpu_top - 1) & 7;
+                        fpu_stack[fpu_top] = 1.0;
+                        break;
+                    case 1: // FLDL2T
+                        fpu_top = (fpu_top - 1) & 7;
+                        fpu_stack[fpu_top] = 3.32192809488736234787;
+                        break;
+                    case 2: // FLDL2E
+                        fpu_top = (fpu_top - 1) & 7;
+                        fpu_stack[fpu_top] = 1.44269504088896340736;
+                        break;
+                    case 3: // FLDPI
+                        fpu_top = (fpu_top - 1) & 7;
+                        fpu_stack[fpu_top] = 3.14159265358979323846;
+                        break;
+                    case 4: // FLDLG2
+                        fpu_top = (fpu_top - 1) & 7;
+                        fpu_stack[fpu_top] = 0.30102999566398119521;
+                        break;
+                    case 5: // FLDLN2
+                        fpu_top = (fpu_top - 1) & 7;
+                        fpu_stack[fpu_top] = 0.69314718055994530942;
+                        break;
+                    case 6: // FLDZ
+                        fpu_top = (fpu_top - 1) & 7;
+                        fpu_stack[fpu_top] = 0.0;
+                        break;
+                    default:
+                        cpu->cycles += 3;
+                        break;
+                }
+                cpu->cycles += 3;
+                break;
+            case 6: // F2XM1, FYL2X, FPTAN etc
+                switch (mrm.rm) {
+                    case 0: // F2XM1
+                        fpu_stack[fpu_top] = pow(2.0, fpu_stack[fpu_top]) - 1.0;
+                        break;
+                    case 1: // FYL2X
+                        fpu_stack[(fpu_top + 1) & 7] *= log2(fpu_stack[fpu_top]);
+                        fpu_top = (fpu_top + 1) & 7;
+                        break;
+                    case 4: // FXTRACT
+                        cpu->cycles += 3;
+                        break;
+                    case 7: // FINCSTP
+                        fpu_top = (fpu_top + 1) & 7;
+                        break;
+                    default:
+                        cpu->cycles += 3;
+                        break;
+                }
+                cpu->cycles += 3;
+                break;
+            case 7: // FPREM, FSQRT, FRNDINT etc
+                switch (mrm.rm) {
+                    case 0: // FPREM
+                        fpu_stack[fpu_top] = fmod(fpu_stack[fpu_top],
+                                                   fpu_stack[(fpu_top + 1) & 7]);
+                        break;
+                    case 4: // FSQRT
+                        fpu_stack[fpu_top] = sqrt(fpu_stack[fpu_top]);
+                        break;
+                    case 5: // FSCALE
+                        fpu_stack[fpu_top] *= pow(2.0,
+                            (double)(int)fpu_stack[(fpu_top + 1) & 7]);
+                        break;
+                    case 6: // FRNDINT
+                        fpu_stack[fpu_top] = round(fpu_stack[fpu_top]);
+                        break;
+                    default:
+                        cpu->cycles += 3;
+                        break;
+                }
+                cpu->cycles += 3;
+                break;
+            default:
+                fprintf(stderr, "unhandled 0xD9 mod=3 reg=%d rm=%d at EIP 0x%08X\n",
+                        mrm.reg, mrm.rm, cpu->eip);
+                cpu->halted = 1;
+                break;
+        }
+        return;
+    }
+
+    // memory forms
+    switch (mrm.reg) {
+        case 0: { // FLD m32
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            uint32_t bits = mem_read32(addr);
+            float val;
+            memcpy(&val, &bits, 4);
+            fpu_top = (fpu_top - 1) & 7;
+            fpu_stack[fpu_top] = (double)val;
+            cpu->cycles += 3;
+            break;
+        }
+        case 2: { // FST m32
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            float val = (float)fpu_stack[fpu_top];
+            uint32_t bits;
+            memcpy(&bits, &val, 4);
+            mem_write32(addr, bits);
+            cpu->cycles += 3;
+            break;
+        }
+        case 3: { // FSTP m32
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            float val = (float)fpu_stack[fpu_top];
+            uint32_t bits;
+            memcpy(&bits, &val, 4);
+            mem_write32(addr, bits);
+            fpu_top = (fpu_top + 1) & 7;
+            cpu->cycles += 3;
+            break;
+        }
+        case 4: { // FLDENV — stub
+            cpu->cycles += 10;
+            break;
+        }
+        case 5: { // FLDCW m16 — load FPU control word, stub
+            cpu->cycles += 3;
+            break;
+        }
+        case 6: { // FNSTENV — stub
+            cpu->cycles += 10;
+            break;
+        }
+        case 7: { // FNSTCW m16 — store FPU control word
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            mem_write16(addr, 0x037F); // default control word
+            cpu->cycles += 3;
+            break;
+        }
+        default:
+            fprintf(stderr, "unhandled 0xD9 reg=%d at EIP 0x%08X\n", mrm.reg, cpu->eip);
+            cpu->halted = 1;
+            break;
+    }
+}
+
+// 0xDB x87 escape
+static void op_db(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+
+    switch (mrm.reg) {
+        case 0: { // FILD m32
+            if (mrm.mod == 3) {
+                cpu->cycles += 3;
+                break;
+            }
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            int32_t val = (int32_t)mem_read32(addr);
+            fpu_top = (fpu_top - 1) & 7;
+            fpu_stack[fpu_top] = (double)val;
+            cpu->cycles += 3;
+            break;
+        }
+        case 2: { // FIST m32
+            if (mrm.mod == 3) {
+                cpu->cycles += 3;
+                break;
+            }
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            mem_write32(addr, (int32_t)fpu_stack[fpu_top]);
+            cpu->cycles += 3;
+            break;
+        }
+        case 3: { // FISTP m32
+            if (mrm.mod == 3) {
+                cpu->cycles += 3;
+                break;
+            }
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            mem_write32(addr, (int32_t)fpu_stack[fpu_top]);
+            fpu_top = (fpu_top + 1) & 7;
+            cpu->cycles += 3;
+            break;
+        }
+        case 4: { // FCLEX / FINIT (mod=3, rm=2/3)
+            // just a no-op, we don't track FPU exceptions
+            cpu->cycles += 3;
+            break;
+        }
+        case 5: { // FLD m80 — 80-bit extended, treat as no-op stub
+            if (mrm.mod == 3) {
+                cpu->cycles += 3;
+                break;
+            }
+            // just push 0, we don't support 80-bit
+            fpu_top = (fpu_top - 1) & 7;
+            fpu_stack[fpu_top] = 0.0;
+            cpu->cycles += 3;
+            break;
+        }
+        case 7: { // FSTP m80 — 80-bit extended, stub
+            if (mrm.mod == 3) {
+                cpu->cycles += 3;
+                break;
+            }
+            fpu_top = (fpu_top + 1) & 7;
+            cpu->cycles += 3;
+            break;
+        }
+        default:
+            fprintf(stderr, "unhandled 0xDB reg=%d at EIP 0x%08X\n", mrm.reg, cpu->eip);
+            cpu->halted = 1;
+            break;
+    }
+}
+
+// 0xDD x87 escape
+static void op_dd(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+
+    switch (mrm.reg) {
+        case 0: { // FLD m64
+            if (mrm.mod == 3) {
+                // FFREE ST(i)
+                cpu->cycles += 3;
+                break;
+            }
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            uint64_t bits = (uint64_t)mem_read32(addr) | ((uint64_t)mem_read32(addr + 4) << 32);
+            double val;
+            memcpy(&val, &bits, 8);
+            fpu_top = (fpu_top - 1) & 7;
+            fpu_stack[fpu_top] = val;
+            cpu->cycles += 3;
+            break;
+        }
+        case 2: { // FST m64
+            if (mrm.mod == 3) {
+                cpu->cycles += 3;
+                break;
+            }
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            uint64_t bits;
+            memcpy(&bits, &fpu_stack[fpu_top], 8);
+            mem_write32(addr,     (uint32_t)(bits));
+            mem_write32(addr + 4, (uint32_t)(bits >> 32));
+            cpu->cycles += 3;
+            break;
+        }
+        case 3: { // FSTP m64
+            if (mrm.mod == 3) {
+                // FSTP ST(i) — copy and pop
+                fpu_stack[(fpu_top + (mrm.rm)) & 7] = fpu_stack[fpu_top];
+                fpu_top = (fpu_top + 1) & 7;
+                cpu->cycles += 3;
+                break;
+            }
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            uint64_t bits;
+            memcpy(&bits, &fpu_stack[fpu_top], 8);
+            mem_write32(addr,     (uint32_t)(bits));
+            mem_write32(addr + 4, (uint32_t)(bits >> 32));
+            fpu_top = (fpu_top + 1) & 7;
+            cpu->cycles += 3;
+            break;
+        }
+        case 4: { // FRSTOR — restore FPU state, stub
+            cpu->cycles += 10;
+            break;
+        }
+        case 6: { // FSAVE — save FPU state, stub
+            cpu->cycles += 10;
+            break;
+        }
+        case 7: { // FNSTSW m16 — store FPU status word
+            if (mrm.mod != 3) {
+                uint32_t addr = resolve_rm_addr(cpu, &mrm);
+                mem_write16(addr, 0);
+            }
+            cpu->cycles += 3;
+            break;
+        }
+        default:
+            fprintf(stderr, "unhandled 0xDD reg=%d at EIP 0x%08X\n", mrm.reg, cpu->eip);
+            cpu->halted = 1;
+            break;
+    }
+}
+
+// 0xDF x87 escape
+static void op_df(i386 *cpu, uint8_t op) {
+    (void)op;
+    ModRM mrm;
+    parse_modrm(cpu, &mrm);
+
+    if (mrm.mod == 3) {
+        switch (mrm.reg) {
+            case 4: // FNSTSW AX — store FPU status word into AX
+                cpu->regs[REG_EAX] = (cpu->regs[REG_EAX] & 0xFFFF0000)
+                                   | ((fpu_top & 7) << 11);
+                cpu->cycles += 3;
+                break;
+            default:
+                fprintf(stderr, "unhandled 0xDF mod=3 reg=%d rm=%d at EIP 0x%08X\n",
+                        mrm.reg, mrm.rm, cpu->eip);
+                cpu->halted = 1;
+                break;
+        }
+        return;
+    }
+
+    switch (mrm.reg) {
+        case 0: { // FILD m16
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            int16_t val = (int16_t)mem_read16(addr);
+            fpu_top = (fpu_top - 1) & 7;
+            fpu_stack[fpu_top] = (double)val;
+            cpu->cycles += 3;
+            break;
+        }
+        case 2: { // FIST m16
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            mem_write16(addr, (int16_t)fpu_stack[fpu_top]);
+            cpu->cycles += 3;
+            break;
+        }
+        case 3: { // FISTP m16
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            mem_write16(addr, (int16_t)fpu_stack[fpu_top]);
+            fpu_top = (fpu_top + 1) & 7;
+            cpu->cycles += 3;
+            break;
+        }
+        case 5: { // FILD m64
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            uint64_t bits = (uint64_t)mem_read32(addr)
+                          | ((uint64_t)mem_read32(addr + 4) << 32);
+            int64_t val;
+            memcpy(&val, &bits, 8);
+            fpu_top = (fpu_top - 1) & 7;
+            fpu_stack[fpu_top] = (double)val;
+            cpu->cycles += 3;
+            break;
+        }
+        case 7: { // FISTP m64
+            uint32_t addr = resolve_rm_addr(cpu, &mrm);
+            int64_t val = (int64_t)fpu_stack[fpu_top];
+            uint64_t bits;
+            memcpy(&bits, &val, 8);
+            mem_write32(addr,     (uint32_t)(bits));
+            mem_write32(addr + 4, (uint32_t)(bits >> 32));
+            fpu_top = (fpu_top + 1) & 7;
+            cpu->cycles += 3;
+            break;
+        }
+        default:
+            fprintf(stderr, "unhandled 0xDF reg=%d at EIP 0x%08X\n", mrm.reg, cpu->eip);
+            cpu->halted = 1;
+            break;
+    }
+}
+
 // 0xE3 JECXZ rel8, jump if ECX is zero
 static void op_jecxz(i386 *cpu, uint8_t op) {
     (void)op;
@@ -1620,7 +2854,7 @@ static void op_repne(i386 *cpu, uint8_t op) {
     (void)op;
     uint8_t next = mem_read8(cpu->eip++);
     switch (next) {
-        case 0xAE: { // REPNE SCASB — used by strlen, strchr
+        case 0xAE: {
             while (cpu->regs[REG_ECX] > 0) {
                 uint8_t a = (uint8_t)cpu->regs[REG_EAX];
                 uint8_t b = mem_read8(cpu->regs[REG_EDI]);
@@ -1636,6 +2870,69 @@ static void op_repne(i386 *cpu, uint8_t op) {
             cpu->cycles += cpu->regs[REG_ECX] + 1;
             break;
         }
+        case 0x0F: {
+            uint8_t sse_op = mem_read8(cpu->eip++);
+            switch (sse_op) {
+                case 0x10: { // MOVSD xmm, xmm/m64
+                    ModRM mrm;
+                    parse_modrm(cpu, &mrm);
+                    uint64_t val;
+                    if (mrm.mod == 3) {
+                        val = xmm_regs[mrm.rm].lo;
+                    } else {
+                        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+                        val = (uint64_t)mem_read32(addr) | ((uint64_t)mem_read32(addr + 4) << 32);
+                    }
+                    xmm_regs[mrm.reg].lo = val;
+                    xmm_regs[mrm.reg].hi = 0;
+                    cpu->cycles += 3;
+                    break;
+                }
+                case 0x11: { // MOVSD xmm/m64, xmm
+                    ModRM mrm;
+                    parse_modrm(cpu, &mrm);
+                    uint64_t val = xmm_regs[mrm.reg].lo;
+                    if (mrm.mod == 3) {
+                        xmm_regs[mrm.rm].lo = val;
+                        xmm_regs[mrm.rm].hi = 0;
+                    } else {
+                        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+                        mem_write32(addr,     (uint32_t)(val));
+                        mem_write32(addr + 4, (uint32_t)(val >> 32));
+                    }
+                    cpu->cycles += 3;
+                    break;
+                }
+                case 0x70: { // PSHUFLW xmm, xmm/m128, imm8
+                    ModRM mrm;
+                    parse_modrm(cpu, &mrm);
+                    XMMReg src = read_xmm_src(cpu, &mrm);
+                    uint8_t imm = mem_read8(cpu->eip++);
+                    uint16_t words[4];
+                    words[0] = (uint16_t)(src.lo >>  0);
+                    words[1] = (uint16_t)(src.lo >> 16);
+                    words[2] = (uint16_t)(src.lo >> 32);
+                    words[3] = (uint16_t)(src.lo >> 48);
+                    uint64_t result_lo =
+                        ((uint64_t)words[(imm >>  0) & 3]      ) |
+                        ((uint64_t)words[(imm >>  2) & 3] << 16) |
+                        ((uint64_t)words[(imm >>  4) & 3] << 32) |
+                        ((uint64_t)words[(imm >>  6) & 3] << 48);
+                    XMMReg out;
+                    out.lo = result_lo;
+                    out.hi = src.hi;
+                    xmm_regs[mrm.reg] = out;
+                    cpu->cycles += 3;
+                    break;
+                }
+                default:
+                    fprintf(stderr, "unhandled REPNE 0x0F instruction 0x%02X at EIP 0x%08X\n",
+                            sse_op, cpu->eip - 2);
+                    cpu->halted = 1;
+                    break;
+            }
+            break;
+        }
         default:
             fprintf(stderr, "unhandled REPNE instruction 0x%02X at EIP 0x%08X\n",
                     next, cpu->eip - 2);
@@ -1649,6 +2946,81 @@ static void op_rep(i386 *cpu, uint8_t op) {
     (void)op;
     uint8_t next = mem_read8(cpu->eip++);
     switch (next) {
+        case 0x0F: {
+            uint8_t sse_op = mem_read8(cpu->eip++);
+            switch (sse_op) {
+                case 0x1E: { // ENDBR32 (CET hint, no-op)
+                    cpu->eip++;
+                    cpu->cycles += 1;
+                    break;
+                }
+                case 0x6F: { // MOVDQU xmm, xmm/m128
+                    ModRM mrm;
+                    parse_modrm(cpu, &mrm);
+                    XMMReg src = read_xmm_src(cpu, &mrm);
+                    xmm_regs[mrm.reg] = src;
+                    cpu->cycles += 3;
+                    break;
+                }
+                case 0x7E: { // MOVQ xmm, xmm/m64
+                    ModRM mrm;
+                    parse_modrm(cpu, &mrm);
+                    uint64_t val;
+                    if (mrm.mod == 3) {
+                        val = xmm_regs[mrm.rm].lo;
+                    } else {
+                        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+                        val = (uint64_t)mem_read32(addr) | ((uint64_t)mem_read32(addr + 4) << 32);
+                    }
+                    xmm_regs[mrm.reg].lo = val;
+                    xmm_regs[mrm.reg].hi = 0;
+                    cpu->cycles += 3;
+                    break;
+                }
+                case 0x7F: { // MOVDQU xmm/m128, xmm
+                    ModRM mrm;
+                    parse_modrm(cpu, &mrm);
+                    XMMReg src = xmm_regs[mrm.reg];
+                    write_xmm_dst(cpu, &mrm, src);
+                    cpu->cycles += 3;
+                    break;
+                }
+                case 0x70: { // PSHUFHW xmm, xmm/m128, imm8
+                    ModRM mrm;
+                    parse_modrm(cpu, &mrm);
+                    uint64_t src_lo, src_hi;
+                    if (mrm.mod == 3) {
+                        src_lo = xmm_regs[mrm.rm].lo;
+                        src_hi = xmm_regs[mrm.rm].hi;
+                    } else {
+                        uint32_t addr = resolve_rm_addr(cpu, &mrm);
+                        src_lo = (uint64_t)mem_read32(addr) | ((uint64_t)mem_read32(addr + 4) << 32);
+                        src_hi = (uint64_t)mem_read32(addr + 8) | ((uint64_t)mem_read32(addr + 12) << 32);
+                    }
+                    uint8_t imm = mem_read8(cpu->eip++);
+                    uint16_t words[4];
+                    words[0] = (uint16_t)(src_hi >>  0);
+                    words[1] = (uint16_t)(src_hi >> 16);
+                    words[2] = (uint16_t)(src_hi >> 32);
+                    words[3] = (uint16_t)(src_hi >> 48);
+                    uint64_t result_hi =
+                        ((uint64_t)words[(imm >>  0) & 3]      ) |
+                        ((uint64_t)words[(imm >>  2) & 3] << 16) |
+                        ((uint64_t)words[(imm >>  4) & 3] << 32) |
+                        ((uint64_t)words[(imm >>  6) & 3] << 48);
+                    xmm_regs[mrm.reg].lo = src_lo;
+                    xmm_regs[mrm.reg].hi = result_hi;
+                    cpu->cycles += 3;
+                    break;
+                }
+                default:
+                    fprintf(stderr, "unhandled REP 0x0F instruction 0x%02X at EIP 0x%08X\n",
+                            sse_op, cpu->eip - 2);
+                    cpu->halted = 1;
+                    break;
+            }
+            break;
+        }
         case 0xA4: {
             uint32_t count = cpu->regs[REG_ECX];
             while (cpu->regs[REG_ECX] > 0) {
@@ -1909,6 +3281,18 @@ static void op_f7_group(i386 *cpu, uint8_t op) {
     }
 }
 
+// 0xFA CLI - clear interrupt flag, no-op in userspace
+static void op_cli(i386 *cpu, uint8_t op) {
+    (void)op;
+    cpu->cycles += 1;
+}
+
+// 0xFB STI - set interrupt flag, no-op in userspace
+static void op_sti(i386 *cpu, uint8_t op) {
+    (void)op;
+    cpu->cycles += 1;
+}
+
 // 0xFC CLD, clears direction flag, REP instructions always go forward so this is a no-op for now
 static void op_cld(i386 *cpu, uint8_t op) {
     (void)op;
@@ -1922,6 +3306,30 @@ static void op_ff_group(i386 *cpu, uint8_t op) {
     parse_modrm(cpu, &mrm);
 
     switch (mrm.reg) {
+        case 0: { // INC r/m32
+            uint32_t val = read_rm32(cpu, &mrm);
+            uint32_t result = val + 1;
+            write_rm32(cpu, &mrm, result);
+            set_zf(cpu, result);
+            set_sf(cpu, result);
+            set_pf(cpu, result);
+            set_of_add(cpu, val, 1, result);
+            // CF intentionally not touched, same as 0x40-0x47
+            cpu->cycles += 2;
+            break;
+        }
+        case 1: { // DEC r/m32
+            uint32_t val = read_rm32(cpu, &mrm);
+            uint32_t result = val - 1;
+            write_rm32(cpu, &mrm, result);
+            set_zf(cpu, result);
+            set_sf(cpu, result);
+            set_pf(cpu, result);
+            set_of_sub(cpu, val, 1, result);
+            // CF intentionally not touched, same as 0x48-0x4F
+            cpu->cycles += 2;
+            break;
+        }
         case 2: {
             uint32_t target = read_rm32(cpu, &mrm);
             cpu->regs[REG_ESP] -= 4;
@@ -1942,6 +3350,15 @@ static void op_ff_group(i386 *cpu, uint8_t op) {
             cpu->cycles += 2;
             break;
         }
+        case 7: { // PUSH m16 — push a 16-bit memory value sign extended to 32
+            uint16_t val = (mrm.mod == 3)
+                ? (uint16_t)cpu->regs[mrm.rm]
+                : mem_read16(resolve_rm_addr(cpu, &mrm));
+            cpu->regs[REG_ESP] -= 4;
+            mem_write32(cpu->regs[REG_ESP], (uint32_t)(int32_t)(int16_t)val);
+            cpu->cycles += 2;
+            break;
+        }
         default:
             fprintf(stderr, "unhandled 0xFF reg=%d at EIP 0x%08X\n", mrm.reg, cpu->eip);
             cpu->halted = 1;
@@ -1956,22 +3373,48 @@ void init_opcode_table(void) {
 
     // 0x0F prefix
     opcode_table[0x0F] = op_prefix_0f;
+    opcode_table_0f[0x10] = op_movups_xmm_rm128;
+    opcode_table_0f[0x11] = op_movups_rm128_xmm;
+    opcode_table_0f[0x16] = op_movhps_xmm_m64;
+    opcode_table_0f[0x17] = op_movhps_m64_xmm;
     for (int i = 0x40; i <= 0x4F; i++) opcode_table_0f[i] = op_cmovcc;
+    opcode_table_0f[0x60] = op_punpcklbw;
+    opcode_table_0f[0x61] = op_punpcklwd;
+    opcode_table_0f[0x62] = op_punpckldq;
+    opcode_table_0f[0x6C] = op_punpcklqdq;
+    opcode_table_0f[0x6D] = op_punpckhqdq;
+    opcode_table_0f[0x6E] = op_movd_mm_rm32;
+    opcode_table_0f[0x6F] = op_movq_mm_rm64;
+    opcode_table_0f[0x70] = op_pshufw;
+    opcode_table_0f[0x74] = op_pcmpeqb;
+    opcode_table_0f[0x7E] = op_movd_rm32_mm;
+    opcode_table_0f[0x7F] = op_movq_rm64_mm2;
     for (int i = 0x80; i <= 0x8F; i++) opcode_table_0f[i] = op_jcc_near;
     for (int i = 0x90; i <= 0x9F; i++) opcode_table_0f[i] = op_setcc;
     opcode_table_0f[0xA2] = op_cpuid;
+    opcode_table_0f[0xA4] = op_shld_rm32_r32_imm8;
     opcode_table_0f[0xAF] = op_imul_r32_rm32;
     opcode_table_0f[0xB1] = op_cmpxchg_rm32_r32;
     opcode_table_0f[0xB6] = op_movzx_r32_rm8;
     opcode_table_0f[0xB7] = op_movzx_r32_rm16;
+    opcode_table_0f[0xBE] = op_movsx_r32_rm8;
+    opcode_table_0f[0xBF] = op_movsx_r32_rm16;
+    opcode_table_0f[0xD6] = op_movq_rm64_mm;
+    opcode_table_0f[0xD7] = op_pmovmskb;
+    opcode_table_0f[0xEF] = op_pxor_mm_mm;
 
+    opcode_table[0x00] = op_add_rm8_r8;
     opcode_table[0x01] = op_add_rm32_r32;
+    opcode_table[0x02] = op_add_r8_rm8;
     opcode_table[0x03] = op_add_r32_rm32;
     opcode_table[0x05] = op_add_eax_imm32;
     opcode_table[0x06] = op_push_sreg; // PUSH ES
     opcode_table[0x07] = op_pop_sreg;  // POP ES
     opcode_table[0x09] = op_or_rm32_r32;
+    opcode_table[0x10] = op_adc_rm8_r8;
+    opcode_table[0x12] = op_adc_r8_rm8;
     opcode_table[0x0B] = op_or_r32_rm32;
+    opcode_table[0x0C] = op_or_al_imm8;
     opcode_table[0x0D] = op_or_eax_imm32;
     opcode_table[0x11] = op_adc_rm32_r32;
     opcode_table[0x13] = op_adc_r32_rm32;
@@ -1981,15 +3424,21 @@ void init_opcode_table(void) {
     opcode_table[0x1B] = op_sbb_r32_rm32;
     opcode_table[0x1E] = op_push_sreg; // PUSH DS
     opcode_table[0x1F] = op_pop_sreg;  // POP DS
+    opcode_table[0x20] = op_and_rm8_r8;
     opcode_table[0x21] = op_and_rm32_r32;
+    opcode_table[0x22] = op_and_r8_rm8;
     opcode_table[0x23] = op_and_r32_rm32;
+    opcode_table[0x24] = op_and_al_imm8;
     opcode_table[0x25] = op_and_eax_imm32;
     opcode_table[0x26] = op_prefix_cs;
     opcode_table[0x29] = op_sub_rm32_r32;
     opcode_table[0x2B] = op_sub_r32_rm32;
+    opcode_table[0x2D] = op_sub_eax_imm32;
     opcode_table[0x2E] = op_prefix_cs;
+    opcode_table[0x30] = op_xor_rm8_r8;
     opcode_table[0x31] = op_xor_rm32_r32;
     opcode_table[0x33] = op_xor_r32_rm32;
+    opcode_table[0x34] = op_xor_al_imm8;
     opcode_table[0x36] = op_prefix_cs;
     opcode_table[0x38] = op_cmp_rm8_r8;
     opcode_table[0x39] = op_cmp_rm32_r32;
@@ -2005,6 +3454,7 @@ void init_opcode_table(void) {
     opcode_table[0x64] = op_prefix_cs;
     opcode_table[0x65] = op_prefix_gs;
     opcode_table[0x66] = op_prefix_66;
+    opcode_table[0x67] = op_prefix_67;
     opcode_table[0x68] = op_push_imm32;
     opcode_table[0x69] = op_imul_r32_rm32_imm32;
     opcode_table[0x6A] = op_push_imm8;
@@ -2024,6 +3474,7 @@ void init_opcode_table(void) {
     opcode_table[0x8E] = op_mov_sreg_rm16;
     opcode_table[0x90] = op_nop;
     for (int i = 0x91; i <= 0x97; i++) opcode_table[i] = op_xchg_eax_r32;
+    opcode_table[0x99] = op_cdq;
     opcode_table[0xA1] = op_mov_eax_mem;
     opcode_table[0xA2] = op_mov_mem_al;
     opcode_table[0xA3] = op_mov_mem_eax;
@@ -2036,14 +3487,22 @@ void init_opcode_table(void) {
     opcode_table[0xAB] = op_stosd;
     opcode_table[0xAE] = op_scasb;
     for (int i = 0xB8; i <= 0xBF; i++) opcode_table[i] = op_mov_r32_imm32;
+    opcode_table[0xC0] = op_c0_group;
     opcode_table[0xC1] = op_c1_group;
+    opcode_table[0xC2] = op_ret_imm16;
     opcode_table[0xC3] = op_ret;
     opcode_table[0xC6] = op_mov_rm8_imm8;
     opcode_table[0xC7] = op_mov_rm32_imm32;
     opcode_table[0xC9] = op_leave;
     opcode_table[0xCD] = op_int;
+    opcode_table[0xD0] = op_d0_group;
     opcode_table[0xD1] = op_d1_group;
+    opcode_table[0xD2] = op_d2_group;
     opcode_table[0xD3] = op_d3_group;
+    opcode_table[0xD9] = op_d9;
+    opcode_table[0xDB] = op_db;
+    opcode_table[0xDD] = op_dd;
+    opcode_table[0xDF] = op_df;
     opcode_table[0xE3] = op_jecxz;
     opcode_table[0xE8] = op_call_rel32;
     opcode_table[0xE9] = op_jmp_near;
@@ -2054,6 +3513,8 @@ void init_opcode_table(void) {
     opcode_table[0xF4] = op_hlt;
     opcode_table[0xF6] = op_f6_group;
     opcode_table[0xF7] = op_f7_group;
+    opcode_table[0xFA] = op_cli;
+    opcode_table[0xFB] = op_sti;
     opcode_table[0xFC] = op_cld;
     opcode_table[0xFF] = op_ff_group;
 }
